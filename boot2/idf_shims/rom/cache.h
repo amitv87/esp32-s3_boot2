@@ -1,0 +1,1 @@
+../../../vendor/idf/esp_rom/esp32s3/include/esp32s3/rom/cache.h

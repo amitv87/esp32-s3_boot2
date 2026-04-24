@@ -70,8 +70,9 @@ def pack_image_header(segment_count: int, entry_addr: int) -> bytes:
         IMAGE_HEADER_FMT,
         ESP_IMAGE_MAGIC,         # magic
         segment_count,           # segment_count
-        0x02,                    # spi_mode = DIO
-        0x20,                    # spi_speed/size = 40MHz / 4MB
+        0x00,                    # spi_mode = QIO (matches vendor firmware)
+        0x4F,                    # spi_speed/size = 80MHz / 16MB
+                                 # (upper nibble 0x4 = 16MB, lower nibble 0xF = 80MHz DIV_1)
         entry_addr,              # entry_addr
         0xEE,                    # wp_pin = disabled
         0, 0, 0,                 # spi_pin_drv[3]

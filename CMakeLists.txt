@@ -32,7 +32,19 @@ else()
 endif()
 
 if(BOOT2_PSRAM STREQUAL "OCTAL")
-    list(APPEND BOOT2_SOURCES boot2/psram.c)
+    list(APPEND BOOT2_SOURCES
+        boot2/psram.c
+        boot2/clk_init.c
+        boot2/idf_shims/libc_stubs.c
+        vendor/idf/esp_psram/esp32s3/esp_psram_impl_octal.c
+        vendor/idf/esp_hw_support/mspi_timing_tuning/mspi_timing_tuning.c
+        vendor/idf/esp_hw_support/mspi_timing_tuning/port/esp32s3/mspi_timing_config.c
+        vendor/idf/esp_hw_support/mspi_timing_tuning/port/esp32s3/mspi_timing_by_mspi_delay.c
+        vendor/idf/soc/esp32s3/gpio_periph.c
+        vendor/idf/hal/cache_hal.c
+        vendor/idf/hal/mmu_hal.c
+        boot2/idf_shims/esp_rom_cache_wrappers.c
+    )
 endif()
 
 add_executable(boot2 ${BOOT2_SOURCES})
@@ -45,6 +57,38 @@ target_include_directories(boot2 PRIVATE
     port
     vendor/soc/esp32s3/register/soc
     vendor/esp_common
+    # Shim stubs first (highest priority)
+    boot2/idf_shims
+    # IDF headers — curated list of ONLY the include dirs that our
+    # target source files transitively need. Adding more would drag
+    # in IDF libc/newlib wrappers that collide with picolibc in the
+    # cross-toolchain.
+    vendor/idf/esp_psram/include
+    vendor/idf/esp_psram/device/include
+    vendor/idf/esp_hw_support/include
+    vendor/idf/esp_hw_support/port/esp32s3/include
+    vendor/idf/esp_hw_support/mspi_timing_tuning/port/esp32s3/include
+    vendor/idf/esp_hw_support/mspi_timing_tuning/include
+    vendor/idf/esp_hw_support/mspi_timing_tuning/tuning_scheme_impl/include
+    vendor/idf/esp_hal_mspi/esp32s3/include
+    vendor/idf/esp_hal_mspi/include
+    vendor/idf/esp_hal_gpspi/esp32s3/include
+    vendor/idf/esp_hal_gpspi/include
+    vendor/idf/hal/esp32s3/include
+    vendor/idf/hal/include
+    vendor/idf/hal/platform_port/include
+    vendor/idf/esp_hal_clock/esp32s3/include
+    vendor/idf/esp_hal_clock/include
+    vendor/idf/soc/esp32s3/include
+    vendor/idf/soc/esp32s3/register
+    vendor/idf/soc/include
+    vendor/idf/esp_common/include
+    vendor/idf/spi_flash/include
+    vendor/idf/esp_blockdev/include
+    vendor/idf/esp_rom/include
+    vendor/idf/bootloader_support/include
+    vendor/idf/esp_rom/esp32s3/include
+    vendor/idf/esp_rom/esp32s3    # for esp_rom_caps.h at that level
 )
 
 target_compile_definitions(boot2 PRIVATE
@@ -99,6 +143,7 @@ if(EXISTS ${PACK_SCRIPT})
 endif()
 
 # ---- Optional test apps ----
-if(BOOT2_BUILD_TESTS)
+# if(BOOT2_BUILD_TESTS)
     add_subdirectory(test/hello-world)
-endif()
+    add_subdirectory(test/hello-world-psram)
+# endif()
