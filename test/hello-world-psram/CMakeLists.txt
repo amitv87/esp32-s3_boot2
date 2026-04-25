@@ -14,6 +14,9 @@ target_link_options(hello_world_psram PRIVATE
     -Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/hello_world_psram.map
     -Wl,--gc-sections
 )
+# Libraries must come after objects in the link command; target_link_libraries
+# guarantees that — target_link_options would place them before the .obj files.
+target_link_libraries(hello_world_psram PRIVATE gcc c m)
 set_property(TARGET hello_world_psram APPEND PROPERTY LINK_DEPENDS ${APP_LINKER_SCRIPT})
 
 set_target_properties(hello_world_psram PROPERTIES

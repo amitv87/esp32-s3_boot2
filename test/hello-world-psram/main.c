@@ -34,11 +34,21 @@ static void delay_us(uint64_t us, uint64_t (*micros_now)(void))
     while (micros_now() - start < us) { }
 }
 
+
 static void app_main(app_context_t *ctx)
 {
+    extern char _bss_start[], _bss_end[];
+    for (char *p = _bss_start; p < _bss_end; p++) *p = 0;
+
     ctx->printf("\r\n=== Hello from PSRAM ===\r\n");
-    for (int tick = 0; ; tick++) {
+
+    void (*delay_us_ptr)(uint64_t us, uint64_t (*micros_now)(void));
+    delay_us_ptr = delay_us;
+
+    for (int tick = 0; tick < 5; tick++) {
         ctx->printf("psram tick %d\r\n", tick);
         delay_us(1000000ULL, ctx->micros_now);
+        // delay_us_ptr(1000000ULL, ctx->micros_now);
     }
+
 }

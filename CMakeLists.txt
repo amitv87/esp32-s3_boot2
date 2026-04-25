@@ -10,7 +10,7 @@ endif()
 
 # ---- Build-time options ----
 set(BOOT2_IO    "USB_JTAG"  CACHE STRING "IO channel: UART | USB_JTAG")
-set(BOOT2_PSRAM "OFF"   CACHE STRING "PSRAM support: OFF | OCTAL")
+set(BOOT2_PSRAM "OCTAL"   CACHE STRING "PSRAM support: OFF | OCTAL")
 option(BOOT2_BUILD_TESTS "Build test apps under test/" OFF)
 set_property(CACHE BOOT2_IO    PROPERTY STRINGS "UART" "USB_JTAG")
 set_property(CACHE BOOT2_PSRAM PROPERTY STRINGS "OFF" "OCTAL")

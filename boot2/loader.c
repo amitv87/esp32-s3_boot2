@@ -216,10 +216,12 @@ void loader_poll(void)
                 }
             }
             if (bytes_read == app_size) {
+#ifdef BOOT2_PSRAM_OCTAL
                 if (dest_is_psram) {
                     extern void psram_enable_cache(void);
                     psram_enable_cache();
                 }
+#endif
 
                 /* Translate DBUS entry to IBUS for code fetch. Use the
                    locally-cached entry pointer — never read through
