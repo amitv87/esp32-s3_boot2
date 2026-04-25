@@ -8,14 +8,6 @@
 
 #define APP_MAGIC 0xDEADBEEFu
 
-/* OPI PSRAM write/read commands + parameters (mirror boot2/psram.c) */
-#define OPI_PSRAM_SYNC_READ             0x0000
-#define OPI_PSRAM_SYNC_WRITE            0x8080
-#define OCT_PSRAM_CMD_BITLEN            16
-#define OCT_PSRAM_ADDR_BITLEN           32
-#define OCT_PSRAM_RD_DUMMY_BITLEN       (2 * (10 - 1))
-#define OCT_PSRAM_WR_DUMMY_BITLEN       (2 * (5  - 1))
-#define ESP_ROM_SPIFLASH_OPI_DTR_MODE   7
 
 /* Apps are linked at a DBUS address so their rodata is byte-accessible,
  * but the CPU can only fetch instructions through an IBUS alias. We
@@ -53,21 +45,6 @@ static inline bool addr_in_psram_dbus(uint32_t a)
     return a >= PSRAM_DBUS_LOW && a < PSRAM_DBUS_HIGH;
 }
 
-/* Write a 32-bit word directly to PSRAM via SPI1/CS1 using the ROM OPI
-   exec helper. Used when the destination address is in the PSRAM
-   virtual range — the cache-mediated path is not yet working on this
-   chip, but the SPI1-direct path is proven reliable across the full
-   capacity by psram.c's connectivity probes. */
-static void psram_spi1_write32(uint32_t phys_off, uint32_t value)
-{
-    esp_rom_opiflash_exec_cmd(1, ESP_ROM_SPIFLASH_OPI_DTR_MODE,
-                              OPI_PSRAM_SYNC_WRITE, OCT_PSRAM_CMD_BITLEN,
-                              phys_off, OCT_PSRAM_ADDR_BITLEN,
-                              OCT_PSRAM_WR_DUMMY_BITLEN,
-                              (uint8_t *)&value, 32,
-                              NULL, 0,
-                              1u << 1, false);
-}
 
 /* ESP32-S3 systimer — a free-running 52-bit counter at 16 MHz (80 MHz APB
    divided by 5). Used to synthesize app_context_t.micros_now. Register
@@ -116,12 +93,7 @@ void loader_poll(void)
        CPU instruction fetch via the IBUS MMU mapping lands on valid
        bytes. */
     bool     dest_is_psram = false;
-    uint32_t psram_off     = 0;
-    /* Cache the header fields locally. For PSRAM destinations we
-       must NOT read back through app_hdr->* since that goes through
-       the (still-suspended) cache and hangs. */
     uint32_t app_size      = 0;
-    void    *app_entry     = NULL;
 
     /* 4-byte staging register for payload writes (see comment below). */
     union { uint32_t w; uint8_t b[4]; } stage = { .w = 0 };
@@ -156,24 +128,8 @@ void loader_poll(void)
                 if (tmp->magic == APP_MAGIC) {
                     app_hdr = (app_image_header_t *)(uintptr_t)tmp->dest_addr;
                     dest_is_psram = addr_in_psram_dbus(tmp->dest_addr);
-                    psram_off = dest_is_psram
-                                ? (tmp->dest_addr - PSRAM_DBUS_LOW) : 0;
                     app_size  = tmp->size;
-                    app_entry = (void *)tmp->entry;
-
-                    if (dest_is_psram) {
-                        /* Header-sized mirror at PSRAM physical offset
-                           via SPI1, one 32-bit word at a time. The
-                           struct is 16 bytes so exactly 4 words. */
-                        const uint32_t *hw = (const uint32_t *)hdr_buf;
-                        for (unsigned w = 0; w < 4; ++w) {
-                            psram_spi1_write32(psram_off + w * 4, hw[w]);
-                        }
-                    } else {
-                        /* Internal-SRAM destination: struct copy via
-                           CPU store (cache-less internal SRAM). */
-                        *app_hdr = *tmp;
-                    }
+                    *app_hdr  = *tmp;
                 } else {
                     ets_printf("bad magic=0x%x size=%u dest=0x%x entry=0x%x\r\n",
                                (unsigned)tmp->magic, (unsigned)tmp->size,
@@ -199,19 +155,9 @@ void loader_poll(void)
                 bool final_byte    = (bytes_read == app_hdr->size);
 
                 if (word_complete || final_byte) {
-                    if (dest_is_psram) {
-                        /* PSRAM target: SPI1-direct write at the
-                           physical offset (header is at psram_off..+16,
-                           so payload[0] lands at psram_off + 16). */
-                        psram_spi1_write32(
-                            psram_off + sizeof(*app_hdr) +
-                                (payload_idx & ~3u),
-                            stage.w);
-                    } else {
-                        uint32_t *dst = (uint32_t *)(void *)
-                            ((uint8_t *)app_hdr->bytes + (payload_idx & ~3u));
-                        *dst = stage.w;
-                    }
+                    uint32_t *dst = (uint32_t *)(void *)
+                        ((uint8_t *)app_hdr->bytes + (payload_idx & ~3u));
+                    *dst = stage.w;
                     stage.w = 0;
                 }
             }
@@ -220,14 +166,26 @@ void loader_poll(void)
                 if (dest_is_psram) {
                     extern void psram_enable_cache(void);
                     psram_enable_cache();
+
+                    /* Flush dirty D-cache lines to PSRAM before the I-cache
+                       re-fetches. The D-cache is write-back: bytes written
+                       via DBUS are in cache, not yet in PSRAM. Without this,
+                       Cache_Invalidate_ICache_All causes the I-cache to fetch
+                       stale data from PSRAM → IllegalInstruction on jump.
+                       Round size up to cache line (32 B) to avoid the ROM
+                       Cache_WriteBack_Addr misalignment bug. */
+                    extern void Cache_WriteBack_Addr(uint32_t addr, uint32_t size);
+                    Cache_WriteBack_Addr(app_hdr->dest_addr,
+                                        (app_size + 31u) & ~31u);
                 }
 #endif
 
-                /* Translate DBUS entry to IBUS for code fetch. Use the
-                   locally-cached entry pointer — never read through
-                   app_hdr->entry for PSRAM destinations. */
+                /* Read the entry point from the header now that cache is
+                   live. dbus_to_ibus handles both old apps (entry is a
+                   DBUS address → converted) and new VMA-split apps (entry
+                   is already IBUS → passed through unchanged). */
                 void (*entry)(app_context_t *) =
-                    (void (*)(app_context_t *))dbus_to_ibus(app_entry);
+                    (void (*)(app_context_t *))dbus_to_ibus((void *)app_hdr->entry);
 
                 ets_printf("jump 0x%x\r\n", (unsigned)(uintptr_t)entry);
                 Cache_Invalidate_ICache_All();

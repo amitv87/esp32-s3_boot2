@@ -42,8 +42,7 @@ static void app_main(app_context_t *ctx)
 
     ctx->printf("\r\n=== Hello from PSRAM ===\r\n");
 
-    void (*delay_us_ptr)(uint64_t us, uint64_t (*micros_now)(void));
-    delay_us_ptr = delay_us;
+    void (*delay_us_ptr)(uint64_t us, uint64_t (*micros_now)(void)) = delay_us;
 
     for (int tick = 0; tick < 5; tick++) {
         ctx->printf("psram tick %d\r\n", tick);

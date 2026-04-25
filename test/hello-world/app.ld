@@ -1,64 +1,68 @@
 /*
- * Linker script for the hello-world RAM app.
+ * Linker script for the hello-world SRAM1 app.
  *
- * Link address must match APP_DEST_ADDR in main.c. Boot2 streams the
- * whole output binary into that address byte-for-byte and then calls
- * the `entry` field of the header, so absolute addresses in .text must
- * resolve correctly at that load location.
+ * VMA/LMA split: code has IBUS VMAs so indirect calls through function
+ * pointers work; data has DBUS VMAs for load/store.  Both windows map
+ * the same physical SRAM1 bytes with a fixed offset of 0x6F0000:
+ *
+ *   SRAM1 DBUS base : 0x3FC90000  (where the loader writes bytes)
+ *   SRAM1 IBUS base : 0x40380000  (where the CPU fetches instructions)
+ *   IBUS - DBUS     : 0x006F0000
+ *
+ * Critical invariant: every code section must satisfy
+ *   VMA - LMA == 0x006F0000
+ * so that the IBUS VMA and the DBUS LMA address the same physical byte.
+ * Achieved by placing all code (including the header) > sram_ibus AT> sram_dbus,
+ * which keeps both region counters in lockstep from byte zero.
+ *
+ * boot2 reads the header from DBUS (the LMA); the entry field holds an
+ * IBUS address; dbus_to_ibus() passes it through unchanged.
+ *
+ * Companion change: pack_app.py uses p_paddr (LMA) not p_vaddr as the
+ * segment destination, producing a compact DBUS-addressed binary.
  */
 
 MEMORY
 {
-    /* DBUS alias of SRAM1. See comment on APP_DEST_ADDR in main.c for
-       why code+rodata lives here instead of at the IBUS alias. */
-    sram (RWX) : ORIGIN = 0x3FC90000, LENGTH = 0x8000   /* 32 KB */
+    sram_ibus (RX) : ORIGIN = 0x40380000, LENGTH = 0x8000   /* SRAM1 instruction window */
+    sram_dbus (RW) : ORIGIN = 0x3FC90000, LENGTH = 0x8000   /* SRAM1 data window        */
 }
 
-/* No ENTRY() — boot2 uses the header's `entry` field, not the ELF
-   entry point. ld warns if neither is set, so point it at a symbol
-   we know exists. */
 ENTRY(__app_hdr)
 
 SECTIONS
 {
-    .image : ALIGN(4)
+    /* ---- Header + code: VMA = IBUS, LMA = DBUS ----------------------- */
+    .app_header : ALIGN(4)
     {
-        __app_image_start = .;
-
-        /* Header struct must be first — boot2 reads offset 0..15 as
-           the app_image_header_t and uses .dest_addr/.size/.entry. */
         KEEP(*(.app_header))
+    } > sram_ibus AT> sram_dbus
 
-        /* Xtensa literal pools must precede their use in the output
-           section. */
-        *(.literal .literal.*)
-        *(.text    .text.*)
-        *(.rodata  .rodata.*)
-        *(.data    .data.*)
-        *(.sdata   .sdata.*)
-        *(.sdata2  .sdata2.*)
+    .literal : { *(.literal .literal.*) } > sram_ibus AT> sram_dbus
+    .text    : { *(.text    .text.*)    } > sram_ibus AT> sram_dbus
 
+    /* ---- Data: VMA = LMA = DBUS -------------------------------------- */
+    .rodata  : { *(.rodata  .rodata.*)  } > sram_dbus
+    .sdata2  : { *(.sdata2  .sdata2.*)  } > sram_dbus
+    .data    :
+    {
+        *(.data  .data.*)
+        *(.sdata .sdata.*)
         . = ALIGN(4);
-        __app_image_end = .;
-    } > sram
+    } > sram_dbus
 
-    /* Export image size as an "address" — main.c casts its value into
-       the header's .size field. */
-    __app_image_size_sym = ABSOLUTE(__app_image_end - __app_image_start);
+    __app_image_size_sym = ABSOLUTE(. - ORIGIN(sram_dbus));
 
-    /* BSS allowed but must be small and we never zero it — so just
-       keep it empty by construction. Any zero-init data via a global
-       would end up here and silently break. */
     .bss (NOLOAD) :
     {
         . = ALIGN(4);
         _bss_start = .;
-        *(.bss .bss.*)
+        *(.bss  .bss.*)
         *(.sbss .sbss.*)
         *(COMMON)
         . = ALIGN(4);
         _bss_end = .;
-    } > sram
+    } > sram_dbus
 
     ASSERT(_bss_end == _bss_start,
            "hello-world app must have empty .bss (no zero-init globals)")

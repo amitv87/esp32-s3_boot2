@@ -25,11 +25,12 @@ set_target_properties(hello_world_psram PROPERTIES
 )
 
 set(HELLO_PSRAM_BIN ${CMAKE_CURRENT_BINARY_DIR}/hello_world_psram.bin)
+set(PACK_APP_SCRIPT ${CMAKE_SOURCE_DIR}/scripts/pack_app.py)
 add_custom_command(
     OUTPUT ${HELLO_PSRAM_BIN}
-    COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:hello_world_psram> ${HELLO_PSRAM_BIN}
-    DEPENDS hello_world_psram
-    COMMENT "[app] hello_world_psram.elf -> hello_world_psram.bin"
+    COMMAND python3 ${PACK_APP_SCRIPT} $<TARGET_FILE:hello_world_psram> ${HELLO_PSRAM_BIN}
+    DEPENDS hello_world_psram ${PACK_APP_SCRIPT}
+    COMMENT "[pack_app] hello_world_psram.elf -> hello_world_psram.bin"
     VERBATIM
 )
 add_custom_target(hello_world_psram_bin ALL DEPENDS ${HELLO_PSRAM_BIN})

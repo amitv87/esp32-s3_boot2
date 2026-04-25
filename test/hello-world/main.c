@@ -54,16 +54,16 @@ const app_image_header_t __app_hdr = {
 static void delay_us(uint64_t us, uint64_t (*micros_now)(void))
 {
     uint64_t start = micros_now();
-    while (micros_now() - start < us) {
-        /* spin */
-    }
+    while (micros_now() - start < us) { }
 }
 
 static void app_main(app_context_t *ctx)
 {
     ctx->printf("\r\n=== ESP32-S3 Hello World ===\r\n");
-    for (int tick = 0; ; tick++) {
+    void (*delay_us_ptr)(uint64_t us, uint64_t (*micros_now)(void)) = delay_us;
+    for (int tick = 0; tick < 5; tick++) {
         ctx->printf("Tick %d\r\n", tick);
         delay_us(1000000ULL, ctx->micros_now);
+        // delay_us_ptr(1000000ULL, ctx->micros_now);
     }
 }

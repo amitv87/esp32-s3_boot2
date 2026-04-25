@@ -32,15 +32,13 @@ set_target_properties(hello_world PROPERTIES
     SUFFIX ".elf"
 )
 
-# Raw binary — exactly what boot2 expects on the wire. Use objcopy -O
-# binary, not the ESP image packer (this is a custom format, not an
-# ESP image).
 set(HELLO_BIN ${CMAKE_CURRENT_BINARY_DIR}/hello_world.bin)
+set(PACK_APP_SCRIPT ${CMAKE_SOURCE_DIR}/scripts/pack_app.py)
 add_custom_command(
     OUTPUT ${HELLO_BIN}
-    COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:hello_world> ${HELLO_BIN}
-    DEPENDS hello_world
-    COMMENT "[app] hello_world.elf -> hello_world.bin"
+    COMMAND python3 ${PACK_APP_SCRIPT} $<TARGET_FILE:hello_world> ${HELLO_BIN}
+    DEPENDS hello_world ${PACK_APP_SCRIPT}
+    COMMENT "[pack_app] hello_world.elf -> hello_world.bin"
     VERBATIM
 )
 add_custom_target(hello_world_bin ALL DEPENDS ${HELLO_BIN})
