@@ -185,11 +185,21 @@ static void app_main(app_context_t *ctx)
     touch_init();
     printf("Touch init done.\r\n");
 
-    /* Diagnostic: paint horizontal color bands so a successful blit is
-     * unmistakable — top third red, middle green, bottom blue. */
+    /* Diagnostic: cycle full-screen solid red → green → blue → bands.
+     * Each fill stays visible for ~1 second so we can see if uniform color
+     * really covers the whole display.  If it does, addressing is sound and
+     * we can move to the bands pattern. */
     uint16_t band_r = rgb(255,   0,   0);
     uint16_t band_g = rgb(  0, 255,   0);
     uint16_t band_b = rgb(  0,   0, 255);
+    for (int phase = 0; phase < 3; phase++) {
+        uint16_t c = (phase == 0) ? band_r : (phase == 1) ? band_g : band_b;
+        fb_fill(c);
+        lcd_blit_frame(framebuffer);
+        printf("Solid fill phase %d done\r\n", phase);
+        for (volatile uint32_t i = 0; i < 60000000u; i++);  /* ~1s */
+    }
+    /* Final pattern: 3 horizontal bands red/green/blue. */
     {
         uint32_t third = LCD_HEIGHT_NATIVE / 3u;
         for (uint32_t r = 0; r < LCD_HEIGHT_NATIVE; r++) {
@@ -224,6 +234,6 @@ static void app_main(app_context_t *ctx)
             prev = false;
         }
         frame++;
-        for (volatile int i = 0; i < 10000; i++);
+        // for (volatile int i = 0; i < 10000; i++);
     }
 }
