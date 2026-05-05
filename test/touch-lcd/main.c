@@ -136,20 +136,27 @@ static void app_main(app_context_t *ctx)
 
     bb_i2c_scan(&sys_bus, "sys GPIO47/48");
 
-    /* lcd_init() drives GPIO21 LOW (LCD+expander reset), then HIGH */
-    printf("LCD init...\r\n");
-    lcd_init();
-    printf("LCD init done.\r\n");
+    /* Hardware reset LCD (GPIO21) BEFORE ioexp_init so the TCA9554 is not
+     * reset by the pulse that happens inside lcd_init.  gpio_output_init
+     * is needed first so GPIO21 is actually driven. */
+    gpio_output_init(21);
+#define DLYMS(ms) for (volatile uint32_t _i=0; _i<(ms)*60000u; _i++)
+    GPIO_OUT_W1TS_REG = 1u << 21;  DLYMS(10);
+    GPIO_OUT_W1TC_REG = 1u << 21;  DLYMS(250);
+    GPIO_OUT_W1TS_REG = 1u << 21;  DLYMS(120);
+    printf("HW reset done\r\n");
 
-    /* IO expander: after lcd_init, expander is out of reset now */
+    /* IO expander: EXIO1=HIGH drives AP3032 CTRL → backlight on.
+     * GPIO8 (LCD_BL) goes to AP3032 FB (brightness), NOT to CTRL.
+     * Driving GPIO8 HIGH kills the backlight by overriding FB reference.
+     * We never configure GPIO8 as output — it stays INPUT (boot default). */
     ioexp_init(&sys_bus, 0x20);
+    /* bl_enable() not needed — GPIO8 is never touched */
 
-    /* Give VSYS ~200ms to stabilise after SYS_EN returned to input mode
-     * (Q3 P-ch FET now fully ON, VSYS charging toward VBAT/USB) */
-    for (volatile uint32_t i = 0; i < 12000000u; i++);  /* ~200ms at 240MHz */
-
-    /* Backlight: release GPIO8 so BL_EN (EXIO1, already HIGH) drives CTRL */
-    bl_enable();
+    /* LCD init — pass micros_now for accurate hardware-timed delays */
+    printf("LCD init...\r\n");
+    lcd_init(ctx->micros_now);
+    printf("LCD init done.\r\n");
 
     /* Verify pin states */
     {
@@ -161,7 +168,7 @@ static void app_main(app_context_t *ctx)
     /* Touch IC (AXS15231B) probe.
      * Simple address-only probe (START+addr+STOP) may NACK because the IC only
      * ACKs once it receives the full 11-byte command frame.  Try the real read. */
-    for (volatile uint32_t i = 0; i < 60000000u; i++);  /* ~1s wait */
+    for (volatile uint32_t i = 0; i < 6000000u; i++);  /* ~1s wait */
     {
         static const uint8_t tp_cmd[11] = {
             0xB5,0xAB,0xA5,0x5A, 0x00,0x00,0x00,0x0E, 0x00,0x00,0x00
@@ -178,10 +185,25 @@ static void app_main(app_context_t *ctx)
     touch_init();
     printf("Touch init done.\r\n");
 
-    uint16_t bg = rgb(0, 0, 80);
-    fb_fill(bg);
+    /* Diagnostic: paint horizontal color bands so a successful blit is
+     * unmistakable — top third red, middle green, bottom blue. */
+    uint16_t band_r = rgb(255,   0,   0);
+    uint16_t band_g = rgb(  0, 255,   0);
+    uint16_t band_b = rgb(  0,   0, 255);
+    {
+        uint32_t third = LCD_HEIGHT_NATIVE / 3u;
+        for (uint32_t r = 0; r < LCD_HEIGHT_NATIVE; r++) {
+            uint16_t c = (r < third) ? band_r : (r < 2u * third) ? band_g : band_b;
+            for (uint32_t x = 0; x < LCD_WIDTH_NATIVE; x++) {
+                framebuffer[r * LCD_WIDTH_NATIVE + x] = c;
+            }
+        }
+    }
     lcd_blit_frame(framebuffer);
-    printf("Frame ready. Touch to paint!\r\n");
+    printf("Frame ready (RGB bands). Touch to paint!\r\n");
+
+    uint16_t bg = rgb(0, 0, 80);
+    (void)bg;
 
     uint16_t red    = rgb(255,  64,  64);
     uint16_t yellow = rgb(255, 220,   0);

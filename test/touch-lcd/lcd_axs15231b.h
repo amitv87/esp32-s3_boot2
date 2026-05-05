@@ -2,7 +2,11 @@
 #include <stdint.h>
 #include "board.h"
 
-void lcd_init(void);
+/* Pass ctx->micros_now for accurate hardware-timed delays.
+ * Without it, busy-loop calibration is CPU-frequency dependent. */
+typedef uint64_t (*lcd_micros_fn_t)(void);
+
+void lcd_init(lcd_micros_fn_t micros_now);
 /* Blit a full LCD_WIDTH_NATIVE × LCD_HEIGHT_NATIVE framebuffer (RGB565, big-endian) */
 void lcd_blit_frame(const uint16_t *fb);
 /* Fill entire display with one color */

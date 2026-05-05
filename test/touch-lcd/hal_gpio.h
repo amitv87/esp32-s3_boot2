@@ -42,6 +42,15 @@ static inline void gpio_matrix_out(int gpio_num, int sig_idx, bool invert)
     *r = (uint32_t)(sig_idx & 0x1FF) | (invert ? (1u << 9) : 0u);
 }
 
+/* ---- GPIO matrix input: route pin → peripheral signal ----
+ * GPIO_FUNCx_IN_SEL_CFG_REG at GPIO_BASE + 0x154 + 4*sig_idx
+ * bits[5:0] = source GPIO, bit 6 = invert, bit 7 = SIG_IN_SEL (1=use matrix) */
+static inline void gpio_matrix_in(int gpio_num, int sig_idx, bool invert)
+{
+    volatile uint32_t *r = (volatile uint32_t *)(GPIO_BASE + 0x154u + 4u * (uint32_t)sig_idx);
+    *r = (uint32_t)(gpio_num & 0x3F) | (invert ? (1u << 6) : 0u) | (1u << 7);
+}
+
 /* ---- Bank-aware helpers (work for all GPIO 0-53) ---- */
 
 static inline void _gpio_out_set(int n, bool v)

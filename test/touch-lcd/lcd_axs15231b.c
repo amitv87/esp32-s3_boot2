@@ -1,168 +1,239 @@
 /*
  * Bare-metal QSPI driver for AXS15231B on Waveshare ESP32-S3-Touch-LCD-3.49.
  *
- * Native panel: 172 cols × 640 rows (portrait).
- * We operate in native portrait mode (MADCTL=0x00), no software rotation.
- * Touch X (0..639) maps to screen row; Touch Y (0..171) maps to screen column.
+ * Hardware: AXS15231B = 172×640 portrait LCD + integrated I2C touch.
  *
- * QSPI protocol (use_qspi_interface=1):
- *   cmd word = (opcode << 24) | (mipi_cmd << 8)
- *   opcode 0x02 → write cmd/param; opcode 0x32 → write pixels (RAMWR)
- *   All bytes sent quad (4-bit) mode on D0-D3.
+ * QSPI protocol (matches reference esp_lcd_panel_io_spi.c):
+ *   - Command headers: 4-byte word `{0x02, 0x00, mipi_cmd, 0x00}` in SINGLE-WIRE
+ *     (only D0/MOSI carries data — opcode 0x02 = "write cmd/param")
+ *   - Parameter bytes: SINGLE-WIRE on D0
+ *   - Pixel data ONLY: 4-wire QUAD on D0..D3
+ *     RAMWR header `{0x32, 0x00, 0x2C, 0x00}` is single-wire, but pixel bytes
+ *     after the header are quad. CS held LOW throughout RAMWR + pixel data.
  *
- * SPI3 (GPSPI3, base 0x60025000) at 40 MHz.
- * CS driven manually via GPIO so it spans multiple 64-byte FIFO chunks.
+ * SPI3 (GPSPI3, base 0x60025000) at 40 MHz, mode 3 (CPOL=1, CPHA=1).
+ * CS driven manually via GPIO so it spans header (single) → data (quad).
+ *
+ * GPIO pin map (board):
+ *   CS=GPIO9, CLK=GPIO10, D0=GPIO11, D1=GPIO12, D2=GPIO13, D3=GPIO14, RST=GPIO21
+ *   GPIO8 (LCD_BL) goes to AP3032 *FB* (brightness) via R37 — must NOT be
+ *   driven HIGH or it kills the LED. Leave as input. Backlight enable is
+ *   via EXIO1 → AP3032 CTRL through the TCA9554 IO expander.
  */
 
 #include "lcd_axs15231b.h"
 #include "board.h"
 #include "hal_gpio.h"
-
 #include "soc/soc.h"
 #include "soc/spi_reg.h"
 #include "soc/system_reg.h"
 #include "soc/io_mux_reg.h"
+#include <stdio.h>
 
-#define SPI_N  3   /* use GPSPI3 */
+#define SPI_N  3   /* GPSPI3 */
 
-/* ---- Delay (busy-loop) ---- */
+/* ---- Accurate delay using ctx->micros_now ---- */
+static lcd_micros_fn_t s_micros = NULL;
 static void delay_ms(uint32_t ms)
 {
-    for (volatile uint32_t i = 0; i < ms * 60000u; i++);
+    if (s_micros) {
+        uint64_t end = s_micros() + (uint64_t)ms * 1000u;
+        while (s_micros() < end) {}
+    } else {
+        for (volatile uint32_t i = 0; i < ms * 240000u; i++);
+    }
 }
 
 /* ---- Manual CS ---- */
 static inline void cs_lo(void) { GPIO_OUT_W1TC_REG = (1u << LCD_PIN_CS); }
 static inline void cs_hi(void) { GPIO_OUT_W1TS_REG = (1u << LCD_PIN_CS); }
 
-/* ---- SPI3 QSPI chunk write (CS already asserted by caller) ----
- * Sends `len` bytes from `buf` in quad mode, chunking through the 64-byte FIFO.
+/* ---- SPI3 chunk write helpers ----
+ *
+ * spi_write_single: bytes go on D0 only (1-wire).
+ * spi_write_quad:   bytes go on all 4 data lines (quad) — pixel data only.
+ *
+ * Both chunk through the SPI 64-byte FIFO.  Caller manages CS.
  */
-static void spi_write_quad(const void *buf, uint32_t len)
+
+static void spi_write_chunk(uint32_t user_flags, const uint8_t *p, uint32_t chunk)
+{
+    uint32_t words = (chunk + 3u) >> 2;
+    for (uint32_t i = 0; i < words; i++) {
+        uint32_t base = i * 4u, w = 0;
+        /* SPI peripheral sends bytes from W register in LSB-byte-first order
+         * (matches ESP-IDF spi_ll_write_buffer's memcpy on little-endian CPU).
+         * So buffer[0] must go to bits[7:0], buffer[3] to bits[31:24]. */
+        for (uint32_t j = 0; j < 4u && (base + j) < chunk; j++)
+            w |= (uint32_t)p[base + j] << (j * 8u);
+        REG_WRITE(SPI_W0_REG(SPI_N) + i * 4u, w);
+    }
+    REG_WRITE(SPI_MS_DLEN_REG(SPI_N), chunk * 8u - 1u);
+    REG_WRITE(SPI_USER_REG(SPI_N), user_flags);
+    /* Sync USER/DLEN into SPI clock domain before triggering */
+    REG_SET_BIT(SPI_CMD_REG(SPI_N), SPI_UPDATE);
+    while (REG_GET_BIT(SPI_CMD_REG(SPI_N), SPI_UPDATE)) {}
+    REG_SET_BIT(SPI_CMD_REG(SPI_N), SPI_USR);
+    while (REG_GET_BIT(SPI_CMD_REG(SPI_N), SPI_USR)) {}
+}
+
+static void spi_write_single(const void *buf, uint32_t len)
 {
     const uint8_t *p = (const uint8_t *)buf;
     while (len) {
         uint32_t chunk = len > 64u ? 64u : len;
-        uint32_t words = (chunk + 3u) >> 2;
-
-        for (uint32_t i = 0; i < words; i++) {
-            uint32_t base = i * 4u, w = 0;
-            for (uint32_t j = 0; j < 4u && (base + j) < chunk; j++)
-                w |= (uint32_t)p[base + j] << (24u - j * 8u);
-            REG_WRITE(SPI_W0_REG(SPI_N) + i * 4u, w);
-        }
-
-        REG_WRITE(SPI_MS_DLEN_REG(SPI_N), chunk * 8u - 1u);
-        REG_WRITE(SPI_USER_REG(SPI_N),
-                  SPI_USR_MOSI | SPI_FWRITE_QUAD | SPI_CS_SETUP | SPI_CS_HOLD);
-
-        /* Sync USER/DLEN registers into SPI clock domain before triggering */
-        REG_SET_BIT(SPI_CMD_REG(SPI_N), SPI_UPDATE);
-        while (REG_GET_BIT(SPI_CMD_REG(SPI_N), SPI_UPDATE)) {}
-
-        REG_SET_BIT(SPI_CMD_REG(SPI_N), SPI_USR);
-        while (REG_GET_BIT(SPI_CMD_REG(SPI_N), SPI_USR)) {}
-
+        spi_write_chunk(SPI_USR_MOSI | SPI_CS_SETUP | SPI_CS_HOLD, p, chunk);
         p   += chunk;
         len -= chunk;
     }
 }
 
-/* ---- QSPI command helpers ---- */
+static void spi_write_quad(const void *buf, uint32_t len)
+{
+    const uint8_t *p = (const uint8_t *)buf;
+    while (len) {
+        uint32_t chunk = len > 64u ? 64u : len;
+        spi_write_chunk(SPI_USR_MOSI | SPI_FWRITE_QUAD | SPI_CS_SETUP | SPI_CS_HOLD,
+                        p, chunk);
+        p   += chunk;
+        len -= chunk;
+    }
+}
+
+/* ---- QSPI command helpers ----
+ * Match upstream esp_lcd_panel_io_spi behavior: with quad_mode=1, only the
+ * pixel-data phase of tx_color goes QUAD; cmd phase, params, and the RAMWR
+ * header all go SINGLE-WIRE on D0.
+ *
+ * lcd_cmd_bits=32, value = (opcode<<24)|(cmd<<8), byte-reversed before the
+ * SPI peripheral consumes it → wire bytes {opcode, 0x00, cmd, 0x00} on D0.
+ */
 static void lcd_cmd(uint8_t cmd)
 {
-    uint8_t w[4] = {0x02, cmd, 0x00, 0x00};
+    uint8_t w[4] = {0x02, 0x00, cmd, 0x00};
     cs_lo();
-    spi_write_quad(w, 4);
+    spi_write_single(w, 4);
     cs_hi();
 }
 
 static void lcd_cmd_data(uint8_t cmd, const uint8_t *data, uint32_t dlen)
 {
-    uint8_t w[4] = {0x02, cmd, 0x00, 0x00};
+    uint8_t w[4] = {0x02, 0x00, cmd, 0x00};
     cs_lo();
-    spi_write_quad(w, 4);
-    if (dlen) spi_write_quad(data, dlen);
+    spi_write_single(w, 4);
+    if (dlen) spi_write_single(data, dlen);
     cs_hi();
 }
 
 /* ---- SPI3 GPIO routing ----
- * Signal indices from gpio_sig_map.h for SPI3 (GPSPI3):
- *   CLK=66, D(MOSI)=68, Q(MISO)=67, HD=69, WP=70, CS0=71
- */
+ * Same signal index for IN and OUT for each pin (peripheral has independent
+ * I/O for each role, multiplexed by the GPIO matrix configuration). */
 #define SIG_SPI3_CLK 66
-#define SIG_SPI3_D   68
-#define SIG_SPI3_Q   67
-#define SIG_SPI3_HD  69
-#define SIG_SPI3_WP  70
+#define SIG_SPI3_D   68    /* MOSI / D0 */
+#define SIG_SPI3_Q   67    /* MISO / D1 */
+#define SIG_SPI3_WP  70    /* D2 */
+#define SIG_SPI3_HD  69    /* D3 */
 
 static void spi3_gpio_setup(void)
 {
-    /* High-drive (FUN_DRV=3) GPIO-matrix function (MCU_SEL=1) for SPI data pins */
+    /* High-drive GPIO-matrix function for SPI bus pins.
+     * IDF uses GPIO_MODE_INPUT_OUTPUT (FUN_IE=1) on SPI3 pins — without
+     * the input buffer enabled the peripheral does not drive the output. */
     static const int spi_data_pins[] = {
         LCD_PIN_CLK, LCD_PIN_DATA0, LCD_PIN_DATA1, LCD_PIN_DATA2, LCD_PIN_DATA3
     };
     for (int i = 0; i < 5; i++) {
         int p = spi_data_pins[i];
-        *iomux_reg(p) = (1u << 12) | (3u << 10);
+        /* MCU_SEL=1 (bit 12), FUN_DRV=3 (bits 11:10), FUN_IE=1 (bit 9) */
+        *iomux_reg(p) = (1u << 12) | (3u << 10) | (1u << 9);
         GPIO_ENABLE_W1TS_REG = 1u << p;
     }
+    /* Route SPI3 signals to/from the correct pins.  IDF connects BOTH input
+     * and output signals to each SPI pin (even output-only pins like MOSI),
+     * and uses GPIO_MODE_INPUT_OUTPUT — without the input wiring back, the
+     * peripheral's output driver may not be enabled.
+     * IMPORTANT: SPI3_WP=70 is D2 (bit 2 of QSPI nibble), SPI3_HD=69 is D3
+     * (bit 3 = MSB).  Board has GPIO13=D2, GPIO14=D3 → WP→GPIO13, HD→GPIO14. */
     gpio_matrix_out(LCD_PIN_CLK,   SIG_SPI3_CLK, false);
+    gpio_matrix_in (LCD_PIN_CLK,   SIG_SPI3_CLK, false);
     gpio_matrix_out(LCD_PIN_DATA0, SIG_SPI3_D,   false);
+    gpio_matrix_in (LCD_PIN_DATA0, SIG_SPI3_D,   false);
     gpio_matrix_out(LCD_PIN_DATA1, SIG_SPI3_Q,   false);
-    gpio_matrix_out(LCD_PIN_DATA2, SIG_SPI3_HD,  false);
-    gpio_matrix_out(LCD_PIN_DATA3, SIG_SPI3_WP,  false);
+    gpio_matrix_in (LCD_PIN_DATA1, SIG_SPI3_Q,   false);
+    gpio_matrix_out(LCD_PIN_DATA2, SIG_SPI3_WP,  false);
+    gpio_matrix_in (LCD_PIN_DATA2, SIG_SPI3_WP,  false);
+    gpio_matrix_out(LCD_PIN_DATA3, SIG_SPI3_HD,  false);
+    gpio_matrix_in (LCD_PIN_DATA3, SIG_SPI3_HD,  false);
 
+    /* CS, RST as plain GPIO outputs.  GPIO8 (LCD_BL) is INTENTIONALLY left
+     * as input — driving it HIGH overrides AP3032 FB and kills the backlight. */
     gpio_output_init(LCD_PIN_CS);
     gpio_output_init(LCD_PIN_RST);
-    gpio_output_init(LCD_PIN_BL);
     cs_hi();
-    GPIO_OUT_W1TS_REG = (1u << LCD_PIN_RST) | (1u << LCD_PIN_BL);
+    GPIO_OUT_W1TS_REG = (1u << LCD_PIN_RST);
 }
 
 /* ---- SPI3 peripheral setup ---- */
 static void spi3_periph_setup(void)
 {
-    /* Enable clock, then do a clean reset (assert → deassert) */
+    /* Enable system clock + clean reset of SPI3 */
     REG_SET_BIT(SYSTEM_PERIP_CLK_EN0_REG, SYSTEM_SPI3_CLK_EN);
     REG_SET_BIT(SYSTEM_PERIP_RST_EN0_REG, SYSTEM_SPI3_RST);
     for (volatile int i = 0; i < 200; i++);
     REG_CLR_BIT(SYSTEM_PERIP_RST_EN0_REG, SYSTEM_SPI3_RST);
 
-    /* Explicitly put in master mode (slave register = 0) */
+    /* Master mode (slave register cleared) */
     REG_WRITE(SPI_SLAVE_REG(SPI_N), 0);
 
-    /* Enable the SPI peripheral's internal clock gate.
-     * SPI_CLK_GATE_REG (offset 0xE8) must be configured or the SPI state
-     * machine has no clock and SPI_USR will never clear.
-     *   bit0 = CLK_EN      (register-bus clock gate)
-     *   bit1 = MST_CLK_ACTIVE (master functional clock)
-     *   bit2 = MST_CLK_SEL   (0=XTAL, 1=PLL/APB → use 1) */
+    /* Internal clock gate: register-bus clock + master functional clock + APB source.
+     * Without this, SPI_USR never clears (state machine has no clock). */
     REG_WRITE(SPI_CLK_GATE_REG(SPI_N),
               SPI_CLK_EN | SPI_MST_CLK_ACTIVE | SPI_MST_CLK_SEL);
 
-    /* Use APB pass-through (80 MHz). Can tune to 40 MHz later. */
-    REG_WRITE(SPI_CLOCK_REG(SPI_N), SPI_CLK_EQU_SYSCLK);
+    /* SPI clock = APB / 8 = 10 MHz (slow for debug; spec allows up to 40MHz)
+     * CLKCNT_N=7, CLKCNT_H=3, CLKCNT_L=7 — 50% duty cycle. */
+    REG_WRITE(SPI_CLOCK_REG(SPI_N), (7u << 12) | (3u << 6) | (7u << 0));
 
-    /* CTRL: enable both FREAD_QUAD and FWRITE_QUAD so all 4 I/O lines are
-     * in QSPI mode; also set WP/HD polarity high so idle lines don't glitch */
-    REG_WRITE(SPI_CTRL_REG(SPI_N),
-              SPI_FREAD_QUAD | SPI_HOLD_POL | SPI_WP_POL);
+    /* CTRL: must use SET_BIT (not WRITE) so SPI_D_POL (bit19) and SPI_Q_POL (bit18)
+     * keep their default=1 — clearing them inverts D0/D1 data on the wire. */
+    REG_SET_BIT(SPI_CTRL_REG(SPI_N),
+                SPI_FREAD_QUAD | SPI_HOLD_POL | SPI_WP_POL);
 
-    /* Disable all hardware-managed CS (we drive CS manually via GPIO) */
+    /* Disable hardware-managed CS (we drive CS manually via GPIO9) */
     REG_SET_BIT(SPI_MISC_REG(SPI_N), SPI_CS0_DIS | SPI_CS1_DIS);
 
-    /* SPI mode 3: clock idles high (CPOL=1) */
-    REG_SET_BIT(SPI_MISC_REG(SPI_N), SPI_CK_IDLE_EDGE);
+    /* SPI mode 0: CK_IDLE_EDGE=0 (clock idles LOW), CK_OUT_EDGE=0 (default).
+     * Try mode 0 — many panels labeled "mode 3" actually accept mode 0 too. */
+    REG_CLR_BIT(SPI_MISC_REG(SPI_N), SPI_CK_IDLE_EDGE);
 
-    /* Sync all register changes from APB domain into SPI module clock domain */
+    /* Sync register changes into SPI clock domain */
     REG_SET_BIT(SPI_CMD_REG(SPI_N), SPI_UPDATE);
     while (REG_GET_BIT(SPI_CMD_REG(SPI_N), SPI_UPDATE)) {}
 }
 
-/* ---- Full vendor init sequence (from Waveshare reference driver) ---- */
-static void lcd_vendor_init(void)
+/* ---- Init sequence ----
+ * Uses vendor_specific_init_default values from upstream esp_lcd_axs15231b —
+ * the only set empirically observed to make the power-on static fade on this
+ * Waveshare panel (= IC accepting the QSPI command frames). The test_apps
+ * QSPI custom values do NOT make the static fade.
+ */
+static void lcd_panel_init(void)
 {
+    /* Software reset first — guarantees identical IC state on cold and warm
+     * boot (panel chip retains state across CPU soft-reset since it has its
+     * own VCC).  Spec requires 5ms after SWRESET before next command. */
+    lcd_cmd(0x01);                                  /* SWRESET */
+    delay_ms(150);
+
+    /* Built-in prologue */
+    lcd_cmd(0x11);                                  /* SLPOUT */
+    delay_ms(120);
+    static const uint8_t madctl[] = {0x00};
+    lcd_cmd_data(0x36, madctl, 1);                  /* MADCTL portrait */
+    static const uint8_t colmod[] = {0x55};
+    lcd_cmd_data(0x3A, colmod, 1);                  /* COLMOD RGB565 */
+
+    /* ---- vendor_specific_init_default proprietary calibration ---- */
     static const uint8_t BB1[] = {0x00,0x00,0x00,0x00,0x00,0x00,0x5A,0xA5};
     lcd_cmd_data(0xBB, BB1, sizeof(BB1));
     static const uint8_t A0[] = {0x00,0x10,0x00,0x02,0x00,0x00,0x64,0x3F,0x20,0x05,0x3F,0x3F,0x00,0x00,0x00,0x00,0x00};
@@ -218,113 +289,101 @@ static void lcd_vendor_init(void)
     static const uint8_t BB2[] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
     lcd_cmd_data(0xBB, BB2, sizeof(BB2));
 
-    lcd_cmd(0x13);          /* Normal Display Mode on */
-    lcd_cmd(0x11);          /* Sleep Out */
-    delay_ms(200);
+    lcd_cmd(0x13);                                  /* NORON */
+    lcd_cmd(0x11);                                  /* SLPOUT */
+    delay_ms(120);
 
-    /* RGB565 pixel format */
-    static const uint8_t colmod[] = {0x55};
-    lcd_cmd_data(0x3A, colmod, 1);
+    /* Dummy RAMWR with 4 zero bytes — present in upstream init array,
+     * appears to "prime" the RAMWR state for QSPI mode */
+    static const uint8_t ramwr_dummy[] = {0x00,0x00,0x00,0x00};
+    lcd_cmd_data(0x2C, ramwr_dummy, sizeof(ramwr_dummy));
 
-    /* MADCTL: native portrait, no rotation (0x00) */
-    static const uint8_t madctl[] = {0x00};
-    lcd_cmd_data(0x36, madctl, 1);
-
-    lcd_cmd(0x29);          /* Display on */
-    delay_ms(200);
+    lcd_cmd(0x29);                                  /* DISPON */
+    delay_ms(120);
 }
 
 /* ======== Public API ======== */
 
-void lcd_init(void)
+void lcd_init(lcd_micros_fn_t micros_now)
 {
-    printf("lcd_init1\n");
+    s_micros = micros_now;
+
+    printf("lcd_init: spi3 setup\r\n");
     spi3_gpio_setup();
-    printf("lcd_init2\n");
     spi3_periph_setup();
-    printf("lcd_init3\n");
 
-    /* Hardware reset sequence */
-    GPIO_OUT_W1TS_REG = 1u << LCD_PIN_RST;  delay_ms(10);
-    GPIO_OUT_W1TC_REG = 1u << LCD_PIN_RST;  delay_ms(30);
-    GPIO_OUT_W1TS_REG = 1u << LCD_PIN_RST;  delay_ms(120);
+    /* Hardware reset.  On cold-power boot the panel internal rails take
+     * longer to settle, so we use a generous post-reset wait (500ms).  On
+     * warm soft-reset this is overkill but harmless. */
+    GPIO_OUT_W1TS_REG = 1u << LCD_PIN_RST;  delay_ms(50);
+    GPIO_OUT_W1TC_REG = 1u << LCD_PIN_RST;  delay_ms(250);
+    GPIO_OUT_W1TS_REG = 1u << LCD_PIN_RST;  delay_ms(500);
+    printf("lcd_init: hw reset done\r\n");
 
-    printf("lcd_init4\n");
-    lcd_vendor_init();
-    printf("lcd_init5\n");
+    lcd_panel_init();
+    printf("lcd_init: panel init done\r\n");
 }
 
 /*
- * Blit a pixel buffer to the display.
- * `fb` must point to LCD_WIDTH_NATIVE × LCD_HEIGHT_NATIVE pixels in RGB565 big-endian.
- * Layout: fb[row * LCD_WIDTH_NATIVE + col], row=0 top, col=0 left.
- * Internally sends CASET(0, LCD_WIDTH_NATIVE-1) + RAMWR + all bytes.
+ * Blit a pixel buffer.  fb = LCD_WIDTH_NATIVE × LCD_HEIGHT_NATIVE pixels in
+ * RGB565 big-endian (high byte first on wire).
+ *
+ * Critical: RAMWR header (single-wire) and ALL pixel data (quad) must be
+ * sent under a SINGLE CS assertion — toggling CS resets the IC's write
+ * pointer.
  */
-void lcd_blit_frame(const uint16_t *fb)
+/* Chunk size matches the reference LVGL flush: 172 cols × 64 rows × 2 bytes */
+#define LCD_CHUNK_ROWS   64
+#define LCD_CHUNK_BYTES  (LCD_WIDTH_NATIVE * LCD_CHUNK_ROWS * 2)
+
+/* Send one chunk of pixel data using RAMWR (first) or RAMWRC (subsequent),
+ * matching panel_axs15231b_draw_bitmap behaviour:
+ *   CASET (every chunk) → RAMWR/RAMWRC + chunk_bytes (single CS for hdr+data)
+ */
+static void lcd_chunk(const uint8_t *p, uint32_t bytes, bool first)
 {
-    /* CASET: all columns 0..171 */
+    /* CASET — same range every chunk, like the reference */
     static const uint8_t caset[] = {0x00, 0x00, 0x00, (uint8_t)(LCD_WIDTH_NATIVE - 1)};
     lcd_cmd_data(0x2A, caset, 4);
 
-    /* RAMWR opcode=0x32, cmd=0x2C */
-    uint8_t hdr[4] = {0x32, 0x2C, 0x00, 0x00};
-
-    uint32_t total = (uint32_t)LCD_WIDTH_NATIVE * LCD_HEIGHT_NATIVE * 2u;
-    const uint8_t *p = (const uint8_t *)fb;
-
+    /* RAMWR header: SINGLE-WIRE on D0 — matches upstream panel_io_spi which
+     * sends the cmd phase of tx_color in 1-bit mode even when quad_mode=1.
+     * Pixel data follows in QUAD on D0..D3, single CS spans both. */
+    uint8_t hdr[4] = {0x32, 0x00, first ? 0x2Cu : 0x3Cu, 0x00};
     cs_lo();
-    /* First chunk includes RAMWR header (4 bytes) + up to 60 bytes of pixel data */
-    {
-        uint8_t first[64];
-        first[0] = 0x32; first[1] = 0x2C; first[2] = 0x00; first[3] = 0x00;
-        uint32_t d = total > 60u ? 60u : total;
-        for (uint32_t i = 0; i < d; i++) first[4 + i] = p[i];
-        spi_write_quad(first, 4 + d);
-        p     += d;
-        total -= d;
-    }
-    /* Remaining: RAMWRC (0x32, 0x3C) + data in 60-byte payloads */
-    while (total) {
-        uint8_t chunk[64];
-        chunk[0] = 0x32; chunk[1] = 0x3C; chunk[2] = 0x00; chunk[3] = 0x00;
-        uint32_t d = total > 60u ? 60u : total;
-        for (uint32_t i = 0; i < d; i++) chunk[4 + i] = p[i];
-        spi_write_quad(chunk, 4 + d);
-        p     += d;
-        total -= d;
-    }
+    spi_write_single(hdr, 4);
+    spi_write_quad(p, bytes);
     cs_hi();
-    (void)hdr;
 }
 
-/* Fill the display with a solid color (no framebuffer needed). */
+void lcd_blit_frame(const uint16_t *fb)
+{
+    const uint8_t *p = (const uint8_t *)fb;
+    uint32_t total = (uint32_t)LCD_WIDTH_NATIVE * LCD_HEIGHT_NATIVE * 2u;
+    bool first = true;
+    while (total) {
+        uint32_t d = total > LCD_CHUNK_BYTES ? LCD_CHUNK_BYTES : total;
+        lcd_chunk(p, d, first);
+        first = false;
+        p     += d;
+        total -= d;
+    }
+}
+
 void lcd_fill(uint16_t color)
 {
-    static const uint8_t caset[] = {0x00, 0x00, 0x00, (uint8_t)(LCD_WIDTH_NATIVE - 1)};
-    lcd_cmd_data(0x2A, caset, 4);
-
     uint8_t hi = (uint8_t)(color >> 8), lo = (uint8_t)(color & 0xFF);
     uint32_t total = (uint32_t)LCD_WIDTH_NATIVE * LCD_HEIGHT_NATIVE * 2u;
-    uint32_t sent = 0;
-    bool first_chunk = true;
+    bool first = true;
 
-    cs_lo();
-    while (sent < total) {
-        uint8_t buf[64];
-        buf[0] = 0x32;
-        buf[1] = first_chunk ? 0x2Cu : 0x3Cu;
-        buf[2] = 0x00; buf[3] = 0x00;
-        first_chunk = false;
+    /* Use a small static chunk buffer pre-filled with the colour */
+    static uint8_t buf[LCD_CHUNK_BYTES];
+    for (uint32_t i = 0; i < LCD_CHUNK_BYTES; i += 2) { buf[i] = hi; buf[i+1] = lo; }
 
-        uint32_t dmax = 60u;
-        uint32_t drem = total - sent;
-        uint32_t d    = drem < dmax ? drem : dmax;
-        for (uint32_t i = 0; i < d; i += 2) {
-            buf[4 + i]     = hi;
-            buf[4 + i + 1] = lo;
-        }
-        spi_write_quad(buf, 4 + d);
-        sent += d;
+    while (total) {
+        uint32_t d = total > LCD_CHUNK_BYTES ? LCD_CHUNK_BYTES : total;
+        lcd_chunk(buf, d, first);
+        first = false;
+        total -= d;
     }
-    cs_hi();
 }
