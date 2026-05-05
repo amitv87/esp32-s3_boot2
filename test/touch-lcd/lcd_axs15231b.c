@@ -191,12 +191,17 @@ static void spi3_periph_setup(void)
               SPI_CLK_EN | SPI_MST_CLK_ACTIVE | SPI_MST_CLK_SEL);
 
 #if 0
-    /* Legacy: SPI clock = APB / 8 = 10 MHz (slow for debug). */
-    REG_WRITE(SPI_CLOCK_REG(SPI_N), (7u << 12) | (3u << 6) | (7u << 0));
-#else
     /* SPI clock = APB / 1 = 80 MHz.  SPI_CLK_EQU_SYSCLK (bit 31) bypasses
-     * the divider entirely.  All other CLOCK_REG bits must be 0. */
+     * the divider entirely.  All other CLOCK_REG bits must be 0.  The panel
+     * boots fine at this rate but the rightmost columns show garbage from
+     * intermittent bit errors at the end of each row chunk — the AXS15231B
+     * is rated for 40 MHz max. */
     REG_WRITE(SPI_CLOCK_REG(SPI_N), (1u << 31));
+#else
+    /* SPI clock = APB / 2 = 40 MHz — the AXS15231B's rated maximum, matches
+     * the Waveshare reference (io_config.pclk_hz = 40 MHz).
+     * CLKCNT_N=1, CLKCNT_H=0, CLKCNT_L=1 → divide by 2 with 50% duty. */
+    REG_WRITE(SPI_CLOCK_REG(SPI_N), (1u << 12) | (1u << 0));
 #endif
 
     /* CTRL: must use SET_BIT (not WRITE) so SPI_D_POL (bit19) and SPI_Q_POL (bit18)
