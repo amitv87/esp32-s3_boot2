@@ -32,7 +32,10 @@ int pico_vprintf(const char *format, va_list va)
     return ret;
 }
 
-static uint16_t framebuffer[LCD_WIDTH_NATIVE * LCD_HEIGHT_NATIVE];
+/* 16-byte aligned for clean GDMA bursts from PSRAM (matches the default
+ * EXT_MEM_BK_SIZE = 16 bytes for the OUT channel). */
+static uint16_t framebuffer[LCD_WIDTH_NATIVE * LCD_HEIGHT_NATIVE]
+    __attribute__((aligned(16)));
 
 static inline uint16_t rgb(uint8_t r, uint8_t g, uint8_t b)
 {

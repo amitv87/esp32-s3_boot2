@@ -88,6 +88,7 @@ static void spi_write_single(const void *buf, uint32_t len)
     }
 }
 
+__attribute__((unused))
 static void spi_write_quad(const void *buf, uint32_t len)
 {
     const uint8_t *p = (const uint8_t *)buf;
@@ -98,6 +99,145 @@ static void spi_write_quad(const void *buf, uint32_t len)
         p   += chunk;
         len -= chunk;
     }
+}
+
+/* ---- GDMA channel 0 OUT — DMA pixel data into SPI3 TX ----
+ * Channel 0 OUT is dedicated to SPI3.  Descriptor chain points at framebuffer
+ * pages (≤4080 bytes each) in PSRAM; cache is flushed before kickoff so DMA
+ * sees the latest CPU writes. */
+#define GDMA_BASE              0x6003F000UL
+#define GDMA_OUT_CONF0_CH0     (*(volatile uint32_t *)(GDMA_BASE + 0x60))
+#define GDMA_OUT_CONF1_CH0     (*(volatile uint32_t *)(GDMA_BASE + 0x64))
+#define GDMA_OUT_INT_RAW_CH0   (*(volatile uint32_t *)(GDMA_BASE + 0x68))
+#define GDMA_OUT_INT_CLR_CH0   (*(volatile uint32_t *)(GDMA_BASE + 0x74))
+#define GDMA_OUT_LINK_CH0      (*(volatile uint32_t *)(GDMA_BASE + 0x80))
+#define GDMA_OUT_PERI_SEL_CH0  (*(volatile uint32_t *)(GDMA_BASE + 0xA8))
+#define GDMA_MISC_CONF         (*(volatile uint32_t *)(GDMA_BASE + 0x3C8))
+
+#define GDMA_BIT_OUT_RST           (1u << 0)
+#define GDMA_BIT_OUT_EOF_MODE      (1u << 3)
+#define GDMA_BIT_OUTDSCR_BURST_EN  (1u << 4)
+#define GDMA_BIT_OUT_DATA_BURST_EN (1u << 5)
+#define GDMA_BIT_GDMA_CLK_EN       (1u << 4)
+#define GDMA_BIT_OUTLINK_START     (1u << 21)
+#define GDMA_BIT_OUT_DONE_INT      (1u << 0)
+#define GDMA_BIT_OUT_TOTAL_EOF_INT (1u << 3)
+
+typedef struct dma_desc {
+    uint32_t dw0;   /* size:12 | length:12 | rsvd:6 | suc_eof:1 | owner:1 */
+    uint32_t buf;
+    uint32_t next;
+} dma_desc_t;
+
+/* 10-row chunks fit in 1 descriptor; 8 covers up to ~32 KB if we ever
+ * grow chunks back toward MS_DLEN's 18-bit limit. */
+#define DMA_BYTES_PER_DESC  4080u
+#define DMA_DESC_POOL       8
+
+/* GDMA's OUT_LINK_ADDR field is 20 bits — the peripheral infers upper bits
+ * from the address space and expects descriptors in INTERNAL SRAM (matches
+ * IDF's MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL constraint).  Our app's BSS lives
+ * in PSRAM, so we can't just declare the pool as a static — the GDMA would
+ * read the wrong region.  Park it at a fixed unused-SRAM address instead.
+ *
+ * boot2 occupies SRAM1 starting at 0x3FCD_1700 (see boot2.ld:
+ * iram_seg_start = 0x3FCD_1700 in DRAM view).  0x3FCD_0000 is in the free
+ * region just below — 256 bytes is more than enough for 8 × 12-byte descs. */
+#define DMA_DESC_SRAM_ADDR  0x3FCD0000u
+static dma_desc_t * const s_dma_descs = (dma_desc_t *)DMA_DESC_SRAM_ADDR;
+
+/* ROM cache flush — CPU writes to PSRAM sit in the L1 cache; force them out
+ * to memory so the GDMA peripheral (which reads PSRAM directly) sees them.
+ * Direct ROM-symbol address avoids needing to add the ROM linker scripts to
+ * the test app's link line. */
+typedef int (*cache_writeback_fn)(uint32_t addr, uint32_t size);
+static const cache_writeback_fn Cache_WriteBack_Addr =
+    (cache_writeback_fn)0x400016c8;
+
+static void gdma_init(void)
+{
+    /* System-level: enable DMA peripheral clock + reset cycle */
+    REG_SET_BIT(SYSTEM_PERIP_CLK_EN1_REG, SYSTEM_DMA_CLK_EN);
+    REG_SET_BIT(SYSTEM_PERIP_RST_EN1_REG, SYSTEM_DMA_RST);
+    for (volatile int i = 0; i < 200; i++);
+    REG_CLR_BIT(SYSTEM_PERIP_RST_EN1_REG, SYSTEM_DMA_RST);
+
+    /* GDMA's internal clock gate */
+    GDMA_MISC_CONF |= GDMA_BIT_GDMA_CLK_EN;
+
+    /* Reset OUT channel 0 then configure for descriptor + data burst mode.
+     * OUT_EOF_MODE deliberately CLEARED — with mode=1 (popped-from-FIFO),
+     * GDMA can over-fetch past MS_DLEN and leak bytes into the next chunk. */
+    GDMA_OUT_CONF0_CH0 = GDMA_BIT_OUT_RST;
+    GDMA_OUT_CONF0_CH0 = 0;
+    GDMA_OUT_CONF0_CH0 = GDMA_BIT_OUT_DATA_BURST_EN |
+                         GDMA_BIT_OUTDSCR_BURST_EN;
+    GDMA_OUT_CONF1_CH0 = 0;             /* default 16-byte PSRAM block size */
+
+    /* Route TX channel to SPI3 (peri index 1 — SPI2=0, SPI3=1) */
+    GDMA_OUT_PERI_SEL_CH0 = 1;
+
+    GDMA_OUT_INT_CLR_CH0 = 0xFFFFFFFFu;
+}
+
+static void spi_write_quad_dma(const void *buf, uint32_t len)
+{
+    /* Build the descriptor chain.  Each descriptor covers up to 4080 bytes;
+     * suc_eof (bit 30) marks the last segment; owner (bit 31) = DMA. */
+    uint32_t addr = (uint32_t)buf;
+    uint32_t remaining = len;
+    int n = 0;
+    while (remaining > 0 && n < DMA_DESC_POOL) {
+        uint32_t bytes = remaining > DMA_BYTES_PER_DESC ? DMA_BYTES_PER_DESC
+                                                        : remaining;
+        bool eof = (remaining == bytes);
+        s_dma_descs[n].dw0 = (uint32_t)bytes |
+                             ((uint32_t)bytes << 12) |
+                             (eof ? (1u << 30) : 0u) |
+                             (1u << 31);
+        s_dma_descs[n].buf  = addr;
+        s_dma_descs[n].next = eof ? 0u : (uint32_t)&s_dma_descs[n + 1];
+        addr += bytes;
+        remaining -= bytes;
+        n++;
+    }
+
+    /* Hand SPI's MOSI source from the W register over to the DMA stream.
+     * Only reset DMA_AFIFO (matches IDF spi_ll_dma_tx_fifo_reset) — resetting
+     * BUF_AFIFO too can drop bytes that the SPI shifter is mid-consuming. */
+    REG_SET_BIT(SPI_DMA_CONF_REG(SPI_N), SPI_DMA_AFIFO_RST);
+    REG_SET_BIT(SPI_DMA_CONF_REG(SPI_N), SPI_DMA_TX_ENA);
+
+    REG_WRITE(SPI_MS_DLEN_REG(SPI_N), len * 8u - 1u);
+    /* USER: just MOSI + QUAD (matches IDF, which doesn't set CS_SETUP/CS_HOLD).
+     * Those bits enable cs_setup_time / cs_hold_time extensions which can add
+     * extra clock cycles per transaction even when the times are zero. */
+    REG_WRITE(SPI_USER_REG(SPI_N), SPI_USR_MOSI | SPI_FWRITE_QUAD);
+
+    REG_SET_BIT(SPI_CMD_REG(SPI_N), SPI_UPDATE);
+    while (REG_GET_BIT(SPI_CMD_REG(SPI_N), SPI_UPDATE)) {}
+
+    /* Clear the TRANS_DONE int so we can poll it after kickoff */
+    REG_WRITE(SPI_DMA_INT_CLR_REG(SPI_N), SPI_TRANS_DONE_INT_CLR);
+
+    /* Start DMA — load first descriptor address (lower 20 bits) + start bit */
+    GDMA_OUT_INT_CLR_CH0 = 0xFFFFFFFFu;
+    GDMA_OUT_LINK_CH0 = ((uint32_t)&s_dma_descs[0] & 0xFFFFFu) |
+                        GDMA_BIT_OUTLINK_START;
+
+    /* Kick the SPI transaction.  Wait on TRANS_DONE_INT (matches IDF) — the
+     * SPI_USR bit clears slightly before the peripheral's MOSI pipeline has
+     * fully drained, and disabling DMA_TX_ENA in that window can cut off
+     * the last few bytes per chunk and accumulate as a y-offset. */
+    REG_SET_BIT(SPI_CMD_REG(SPI_N), SPI_USR);
+    while (!(REG_READ(SPI_DMA_INT_RAW_REG(SPI_N)) & SPI_TRANS_DONE_INT_RAW)) {}
+
+    /* Brief settle delay — gives the panel time to commit the chunk's
+     * bytes to its internal RAM before CS rises. */
+    for (volatile int i = 0; i < 200; i++);
+
+    /* Restore SPI MOSI source to W register for subsequent CPU writes */
+    REG_CLR_BIT(SPI_DMA_CONF_REG(SPI_N), SPI_DMA_TX_ENA);
 }
 
 /* ---- QSPI command helpers ----
@@ -182,8 +322,15 @@ static void spi3_periph_setup(void)
     for (volatile int i = 0; i < 200; i++);
     REG_CLR_BIT(SYSTEM_PERIP_RST_EN0_REG, SYSTEM_SPI3_RST);
 
-    /* Master mode (slave register cleared) */
+    /* Master mode + clean register state (matches Zephyr/IDF spi_ll_master_init).
+     * SLAVE, USER, USER1, USER2, ADDR all start zeroed so per-transaction
+     * REG_WRITE only needs to set bits it actually wants — no stale
+     * usr_command_bitlen, usr_addr_bitlen, usr_dummy_cyclelen, etc. */
     REG_WRITE(SPI_SLAVE_REG(SPI_N), 0);
+    REG_WRITE(SPI_USER_REG(SPI_N),  0);
+    REG_WRITE(SPI_USER1_REG(SPI_N), 0);
+    REG_WRITE(SPI_USER2_REG(SPI_N), 0);
+    REG_WRITE(SPI_ADDR_REG(SPI_N),  0);
 
     /* Internal clock gate: register-bus clock + master functional clock + APB source.
      * Without this, SPI_USR never clears (state machine has no clock). */
@@ -216,9 +363,19 @@ static void spi3_periph_setup(void)
      * Try mode 0 — many panels labeled "mode 3" actually accept mode 0 too. */
     REG_CLR_BIT(SPI_MISC_REG(SPI_N), SPI_CK_IDLE_EDGE);
 
+    /* Match Zephyr's spi_ll_master_init: zero out dma_conf then set only the
+     * SEG_TRANS_CLR enables.  Without `tx_seg_trans_clr_en = 1`, the
+     * dma_outfifo_empty_vld signal may stay sticky across transactions and
+     * leak bytes into subsequent chunks. */
+    REG_WRITE(SPI_DMA_CONF_REG(SPI_N),
+              SPI_SLV_TX_SEG_TRANS_CLR_EN | SPI_SLV_RX_SEG_TRANS_CLR_EN);
+
     /* Sync register changes into SPI clock domain */
     REG_SET_BIT(SPI_CMD_REG(SPI_N), SPI_UPDATE);
     while (REG_GET_BIT(SPI_CMD_REG(SPI_N), SPI_UPDATE)) {}
+
+    /* GDMA channel 0 OUT → SPI3 TX, used for pixel-data writes */
+    gdma_init();
 }
 
 /* ---- Init sequence ----
@@ -298,14 +455,16 @@ void lcd_init(lcd_micros_fn_t micros_now)
  * sent under a SINGLE CS assertion — toggling CS resets the IC's write
  * pointer.
  */
-/* Chunk size matches the reference LVGL flush: 172 cols × 64 rows × 2 bytes */
-#define LCD_CHUNK_ROWS   64
+/* Chunk size constraints:
+ *   - SPI_MS_DATA_BITLEN is an 18-bit field → max 32 KB per SPI transaction.
+ *   - Each GDMA descriptor holds ≤ 4080 bytes (12-bit size field).
+ * 10 rows × 172 cols × 2 bytes = 3440 bytes fits in a single descriptor. */
+#define LCD_CHUNK_ROWS   10
 #define LCD_CHUNK_BYTES  (LCD_WIDTH_NATIVE * LCD_CHUNK_ROWS * 2)
 
-/* Send one chunk of pixel data using RAMWR (first) or RAMWRC (subsequent),
- * matching panel_axs15231b_draw_bitmap behaviour:
- *   CASET (every chunk) → RAMWR/RAMWRC + chunk_bytes (single CS for hdr+data)
- */
+/* Send one chunk of pixel data.  CASET each chunk; RAMWR for the first chunk
+ * (which resets the cursor to RASET_start), RAMWRC for subsequent chunks.
+ * RASET is sent ONCE per frame from lcd_blit_frame, not per chunk. */
 static void lcd_chunk(const uint8_t *p, uint32_t bytes, bool first)
 {
     /* CASET — same range every chunk, like the reference */
@@ -318,7 +477,19 @@ static void lcd_chunk(const uint8_t *p, uint32_t bytes, bool first)
     uint8_t hdr[4] = {0x32, 0x00, first ? 0x2Cu : 0x3Cu, 0x00};
     cs_lo();
     spi_write_single(hdr, 4);
+#if 0
+    /* GDMA channel 0 streams the chunk directly from PSRAM into SPI3 TX.
+     * Disabled: produces a consistent ~25-pixel y-offset across the frame
+     * that we couldn't pin down without a logic analyzer.  Probable causes
+     * tried and ruled out: cache flush alignment, descriptor chaining,
+     * MS_DLEN width, EOF mode, BUF_AFIFO reset, FREAD_QUAD, SPI mode 0/3,
+     * 80/40/20/10 MHz, RASET window, USER1/USER2 zeroing, seg_trans_clr_en,
+     * settle delays, GDMA channel reset.  The CPU path stays in service. */
+    spi_write_quad_dma(p, bytes);
+#else
+    /* CPU walks the 64-byte SPI FIFO in a tight loop — slower but correct. */
     spi_write_quad(p, bytes);
+#endif
     cs_hi();
 }
 
@@ -326,6 +497,14 @@ void lcd_blit_frame(const uint16_t *fb)
 {
     const uint8_t *p = (const uint8_t *)fb;
     uint32_t total = (uint32_t)LCD_WIDTH_NATIVE * LCD_HEIGHT_NATIVE * 2u;
+
+    /* Flush the entire framebuffer's L1 cache lines once up front so GDMA
+     * sees the latest CPU writes for every chunk.  Cache_WriteBack_Addr has
+     * a documented alignment bug — round to 32-byte cache-line bounds. */
+    uint32_t flush_addr = (uint32_t)p & ~0x1Fu;
+    uint32_t flush_end  = ((uint32_t)p + total + 0x1Fu) & ~0x1Fu;
+    Cache_WriteBack_Addr(flush_addr, flush_end - flush_addr);
+
     bool first = true;
     while (total) {
         uint32_t d = total > LCD_CHUNK_BYTES ? LCD_CHUNK_BYTES : total;
@@ -342,9 +521,12 @@ void lcd_fill(uint16_t color)
     uint32_t total = (uint32_t)LCD_WIDTH_NATIVE * LCD_HEIGHT_NATIVE * 2u;
     bool first = true;
 
-    /* Use a small static chunk buffer pre-filled with the colour */
-    static uint8_t buf[LCD_CHUNK_BYTES];
+    /* Use a small static chunk buffer pre-filled with the colour. */
+    static uint8_t buf[LCD_CHUNK_BYTES] __attribute__((aligned(16)));
     for (uint32_t i = 0; i < LCD_CHUNK_BYTES; i += 2) { buf[i] = hi; buf[i+1] = lo; }
+
+    /* Flush the prefill once — the same buffer is reused for every chunk. */
+    Cache_WriteBack_Addr((uint32_t)buf, LCD_CHUNK_BYTES);
 
     while (total) {
         uint32_t d = total > LCD_CHUNK_BYTES ? LCD_CHUNK_BYTES : total;
