@@ -161,6 +161,9 @@ static void app_main(app_context_t *ctx)
     lcd_init(ctx->micros_now);
     printf("LCD init done.\r\n");
 
+    /* QSPI wire-format diagnostic — read panel ID registers and compare */
+    lcd_read_id();
+
     /* Verify pin states */
     {
         uint32_t gin = GPIO_IN_REG;

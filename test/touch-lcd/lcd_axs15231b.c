@@ -180,11 +180,20 @@ static void gdma_init(void)
     GDMA_OUT_INT_CLR_CH0 = 0xFFFFFFFFu;
 }
 
+/* IDF-style two-phase: caller sends the 4-byte header {opcode, 0x00, mipi_cmd,
+ * 0x00} single-wire under CS-low (via spi_write_chunk), then this function
+ * sends the pixel bytes — pure DATA phase, QUAD MOSI, via DMA.
+ *
+ * Earlier "atomic" approach (cmd phase + addr phase + data phase in one SPI
+ * transaction) had a 4-bit color shift on the data — likely from peripheral
+ * inserting a transition cycle between single-wire addr and QUAD data when
+ * DMA is the data source.  Splitting into two transactions matches what
+ * esp_lcd_panel_io_spi.c does (cmd as polling single-wire data + color as
+ * QIO data), avoiding the transition entirely. */
 static void spi_write_quad_dma(const void *buf, uint32_t len)
 {
-    /* Build the descriptor chain.  Each descriptor covers up to 4080 bytes;
-     * suc_eof (bit 30) marks the last segment; owner (bit 31) = DMA. */
-    uint32_t addr = (uint32_t)buf;
+    /* Build the descriptor chain. */
+    uint32_t a = (uint32_t)buf;
     uint32_t remaining = len;
     int n = 0;
     while (remaining > 0 && n < DMA_DESC_POOL) {
@@ -195,49 +204,64 @@ static void spi_write_quad_dma(const void *buf, uint32_t len)
                              ((uint32_t)bytes << 12) |
                              (eof ? (1u << 30) : 0u) |
                              (1u << 31);
-        s_dma_descs[n].buf  = addr;
+        s_dma_descs[n].buf  = a;
         s_dma_descs[n].next = eof ? 0u : (uint32_t)&s_dma_descs[n + 1];
-        addr += bytes;
+        a += bytes;
         remaining -= bytes;
         n++;
     }
 
-    /* Hand SPI's MOSI source from the W register over to the DMA stream.
-     * Only reset DMA_AFIFO (matches IDF spi_ll_dma_tx_fifo_reset) — resetting
-     * BUF_AFIFO too can drop bytes that the SPI shifter is mid-consuming. */
-    REG_SET_BIT(SPI_DMA_CONF_REG(SPI_N), SPI_DMA_AFIFO_RST);
+    /* GDMA channel reset + outlink load — match NuttX's esp32s3_dma_load:
+     * pulse OUT_RST, then clear+set the OUTLINK_ADDR field as separate
+     * writes BEFORE the START bit. Doing it in one combined write breaks
+     * descriptor chaining — only the first descriptor's data flows. */
+    GDMA_OUT_CONF0_CH0 |= GDMA_BIT_OUT_RST;
+    GDMA_OUT_CONF0_CH0 &= ~GDMA_BIT_OUT_RST;
+
+    GDMA_OUT_LINK_CH0 = GDMA_OUT_LINK_CH0 & ~0xFFFFFu;
+    GDMA_OUT_LINK_CH0 = (GDMA_OUT_LINK_CH0 & ~0xFFFFFu) |
+                       ((uint32_t)&s_dma_descs[0] & 0xFFFFFu);
+
+    /* Reset DMA AFIFO + enable DMA TX */
+    REG_SET_BIT(SPI_DMA_CONF_REG(SPI_N),
+                SPI_DMA_AFIFO_RST | SPI_BUF_AFIFO_RST | SPI_RX_AFIFO_RST);
     REG_SET_BIT(SPI_DMA_CONF_REG(SPI_N), SPI_DMA_TX_ENA);
 
+    /* No cmd phase, no addr phase — pure DATA QUAD MOSI. */
+    REG_WRITE(SPI_USER2_REG(SPI_N), 0);
+    REG_WRITE(SPI_USER1_REG(SPI_N), 0);
     REG_WRITE(SPI_MS_DLEN_REG(SPI_N), len * 8u - 1u);
-    /* USER: just MOSI + QUAD (matches IDF, which doesn't set CS_SETUP/CS_HOLD).
-     * Those bits enable cs_setup_time / cs_hold_time extensions which can add
-     * extra clock cycles per transaction even when the times are zero. */
-    REG_WRITE(SPI_USER_REG(SPI_N), SPI_USR_MOSI | SPI_FWRITE_QUAD);
+    REG_WRITE(SPI_USER_REG(SPI_N),
+              SPI_USR_MOSI | SPI_FWRITE_QUAD |
+              SPI_CS_SETUP | SPI_CS_HOLD);
+
+    /* CTRL: clear quad cmd/addr bits + DUMMY_OUT */
+    uint32_t ctrl = REG_READ(SPI_CTRL_REG(SPI_N));
+    ctrl &= ~(SPI_FCMD_DUAL | SPI_FCMD_QUAD |
+              SPI_FADDR_DUAL | SPI_FADDR_QUAD |
+              SPI_DUMMY_OUT);
+    REG_WRITE(SPI_CTRL_REG(SPI_N), ctrl);
 
     REG_SET_BIT(SPI_CMD_REG(SPI_N), SPI_UPDATE);
     while (REG_GET_BIT(SPI_CMD_REG(SPI_N), SPI_UPDATE)) {}
 
-    /* Clear the TRANS_DONE int so we can poll it after kickoff */
     REG_WRITE(SPI_DMA_INT_CLR_REG(SPI_N), SPI_TRANS_DONE_INT_CLR);
-
-    /* Start DMA — load first descriptor address (lower 20 bits) + start bit */
     GDMA_OUT_INT_CLR_CH0 = 0xFFFFFFFFu;
-    GDMA_OUT_LINK_CH0 = ((uint32_t)&s_dma_descs[0] & 0xFFFFFu) |
-                        GDMA_BIT_OUTLINK_START;
+    GDMA_OUT_LINK_CH0 |= GDMA_BIT_OUTLINK_START;
 
-    /* Kick the SPI transaction.  Wait on TRANS_DONE_INT (matches IDF) — the
-     * SPI_USR bit clears slightly before the peripheral's MOSI pipeline has
-     * fully drained, and disabling DMA_TX_ENA in that window can cut off
-     * the last few bytes per chunk and accumulate as a y-offset. */
+    /* Wait for DMA to prime the SPI TX FIFO before SPI_USR.  Without this,
+     * SPI starts the data phase before the FIFO has data and outputs zero
+     * for the first cycle — looks like a 4-bit forward shift on the wire
+     * (red→pink, green→light-green, blue→near-black; non-uniform regions
+     * smear into full-width bands).  OUTFIFO_EMPTY=0 → FIFO has data. */
+    while (REG_READ(SPI_DMA_CONF_REG(SPI_N)) & SPI_DMA_OUTFIFO_EMPTY) {}
+
     REG_SET_BIT(SPI_CMD_REG(SPI_N), SPI_USR);
     while (!(REG_READ(SPI_DMA_INT_RAW_REG(SPI_N)) & SPI_TRANS_DONE_INT_RAW)) {}
 
-    /* Brief settle delay — gives the panel time to commit the chunk's
-     * bytes to its internal RAM before CS rises. */
-    for (volatile int i = 0; i < 200; i++);
-
-    /* Restore SPI MOSI source to W register for subsequent CPU writes */
+    /* Disable DMA TX for subsequent CPU transactions (CASET, etc.). */
     REG_CLR_BIT(SPI_DMA_CONF_REG(SPI_N), SPI_DMA_TX_ENA);
+    REG_WRITE(SPI_USER_REG(SPI_N), 0);
 }
 
 /* ---- QSPI command helpers ----
@@ -322,15 +346,8 @@ static void spi3_periph_setup(void)
     for (volatile int i = 0; i < 200; i++);
     REG_CLR_BIT(SYSTEM_PERIP_RST_EN0_REG, SYSTEM_SPI3_RST);
 
-    /* Master mode + clean register state (matches Zephyr/IDF spi_ll_master_init).
-     * SLAVE, USER, USER1, USER2, ADDR all start zeroed so per-transaction
-     * REG_WRITE only needs to set bits it actually wants — no stale
-     * usr_command_bitlen, usr_addr_bitlen, usr_dummy_cyclelen, etc. */
+    /* Master mode (slave register cleared) */
     REG_WRITE(SPI_SLAVE_REG(SPI_N), 0);
-    REG_WRITE(SPI_USER_REG(SPI_N),  0);
-    REG_WRITE(SPI_USER1_REG(SPI_N), 0);
-    REG_WRITE(SPI_USER2_REG(SPI_N), 0);
-    REG_WRITE(SPI_ADDR_REG(SPI_N),  0);
 
     /* Internal clock gate: register-bus clock + master functional clock + APB source.
      * Without this, SPI_USR never clears (state machine has no clock). */
@@ -345,10 +362,11 @@ static void spi3_periph_setup(void)
      * is rated for 40 MHz max. */
     REG_WRITE(SPI_CLOCK_REG(SPI_N), (1u << 31));
 #else
-    /* SPI clock = APB / 2 = 40 MHz — the AXS15231B's rated maximum, matches
-     * the Waveshare reference (io_config.pclk_hz = 40 MHz).
-     * CLKCNT_N=1, CLKCNT_H=0, CLKCNT_L=1 → divide by 2 with 50% duty. */
-    REG_WRITE(SPI_CLOCK_REG(SPI_N), (1u << 12) | (1u << 0));
+    /* SPI clock = APB / 8 = 10 MHz.  The cmd+addr+data DMA transaction
+     * streams pixels continuously (no per-sub-chunk idle like the CPU path
+     * had), so we drop to 10 MHz to give the panel plenty of commit margin.
+     * CLKCNT_N=7, CLKCNT_H=3, CLKCNT_L=7 — 50% duty. */
+    REG_WRITE(SPI_CLOCK_REG(SPI_N), (7u << 12) | (3u << 6) | (7u << 0));
 #endif
 
     /* CTRL: must use SET_BIT (not WRITE) so SPI_D_POL (bit19) and SPI_Q_POL (bit18)
@@ -362,13 +380,6 @@ static void spi3_periph_setup(void)
     /* SPI mode 0: CK_IDLE_EDGE=0 (clock idles LOW), CK_OUT_EDGE=0 (default).
      * Try mode 0 — many panels labeled "mode 3" actually accept mode 0 too. */
     REG_CLR_BIT(SPI_MISC_REG(SPI_N), SPI_CK_IDLE_EDGE);
-
-    /* Match Zephyr's spi_ll_master_init: zero out dma_conf then set only the
-     * SEG_TRANS_CLR enables.  Without `tx_seg_trans_clr_en = 1`, the
-     * dma_outfifo_empty_vld signal may stay sticky across transactions and
-     * leak bytes into subsequent chunks. */
-    REG_WRITE(SPI_DMA_CONF_REG(SPI_N),
-              SPI_SLV_TX_SEG_TRANS_CLR_EN | SPI_SLV_RX_SEG_TRANS_CLR_EN);
 
     /* Sync register changes into SPI clock domain */
     REG_SET_BIT(SPI_CMD_REG(SPI_N), SPI_UPDATE);
@@ -426,6 +437,59 @@ static void lcd_panel_init(void)
 
 /* ======== Public API ======== */
 
+/* QSPI read: send (0x0B, 0x00, cmd, 0x00) single-wire on D0, then read
+ * `nbytes` back single-wire on D1 (MISO).  Datasheet section 4.4.2.
+ * Used for diagnostic — compares panel-reported IDs against datasheet
+ * defaults to verify the wire transport. */
+static uint8_t lcd_read1(uint8_t cmd)
+{
+    /* Disable DMA and clear any leftover cmd/addr/dummy phase config from a
+     * previous DMA transaction. */
+    REG_CLR_BIT(SPI_DMA_CONF_REG(SPI_N), SPI_DMA_TX_ENA | SPI_DMA_RX_ENA);
+    REG_WRITE(SPI_USER1_REG(SPI_N), 0);
+    REG_WRITE(SPI_USER2_REG(SPI_N), 0);
+
+    /* Pack 4 bytes (0x0B, 0x00, cmd, 0x00) into W0 — LSB-byte-first packing
+     * matches the SPI peripheral's read order. */
+    uint32_t w0 = (uint32_t)0x0B | (0u << 8) | ((uint32_t)cmd << 16) | (0u << 24);
+    REG_WRITE(SPI_W0_REG(SPI_N), w0);
+
+    /* MOSI 32 bits single-wire, then 8 bits MISO single-wire (no FREAD_QUAD). */
+    REG_WRITE(SPI_MS_DLEN_REG(SPI_N), 32u + 8u - 1u);
+    REG_WRITE(SPI_USER_REG(SPI_N),
+              SPI_USR_MOSI | SPI_USR_MISO);
+
+    /* CTRL: ensure all FREAD/FCMD/FADDR quad bits are clear */
+    uint32_t ctrl = REG_READ(SPI_CTRL_REG(SPI_N));
+    ctrl &= ~(SPI_FCMD_DUAL | SPI_FCMD_QUAD |
+              SPI_FADDR_DUAL | SPI_FADDR_QUAD |
+              SPI_FREAD_DUAL | SPI_FREAD_QUAD);
+    REG_WRITE(SPI_CTRL_REG(SPI_N), ctrl);
+
+    REG_SET_BIT(SPI_CMD_REG(SPI_N), SPI_UPDATE);
+    while (REG_GET_BIT(SPI_CMD_REG(SPI_N), SPI_UPDATE)) {}
+
+    cs_lo();
+    REG_SET_BIT(SPI_CMD_REG(SPI_N), SPI_USR);
+    while (REG_GET_BIT(SPI_CMD_REG(SPI_N), SPI_USR)) {}
+    cs_hi();
+
+    /* MISO data lands in W register at bit position right after MOSI bits.
+     * For 32-bit MOSI + 8-bit MISO, the 8 RX bits are packed into the LOWER
+     * byte of W0 (the receive side puts data starting at bit 0). */
+    uint32_t r = REG_READ(SPI_W0_REG(SPI_N));
+    return (uint8_t)(r & 0xFFu);
+}
+
+void lcd_read_id(void)
+{
+    uint8_t id1 = lcd_read1(0xDA);
+    uint8_t id2 = lcd_read1(0xDB);
+    uint8_t id3 = lcd_read1(0xDC);
+    printf("LCD IDs: DA=0x%02X (expect 0x40), DB=0x%02X (expect 0x00), "
+           "DC=0x%02X (expect 0x03)\r\n", id1, id2, id3);
+}
+
 void lcd_init(lcd_micros_fn_t micros_now)
 {
     s_micros = micros_now;
@@ -456,10 +520,14 @@ void lcd_init(lcd_micros_fn_t micros_now)
  * pointer.
  */
 /* Chunk size constraints:
- *   - SPI_MS_DATA_BITLEN is an 18-bit field → max 32 KB per SPI transaction.
+ *   - SPI_MS_DATA_BITLEN is 18-bit → max 32 KB per SPI transaction.
  *   - Each GDMA descriptor holds ≤ 4080 bytes (12-bit size field).
- * 10 rows × 172 cols × 2 bytes = 3440 bytes fits in a single descriptor. */
-#define LCD_CHUNK_ROWS   10
+ *   - Per-chunk DMA setup introduces a tiny consistent error that
+ *     accumulates into a y-offset, so larger chunks (= fewer transitions
+ *     per frame) minimize total drift.
+ * 80 rows × 172 cols × 2 bytes = 27520 bytes — fits in MS_DLEN, uses 7
+ * descriptors, and gives 8 chunks per frame (vs 64 with 10-row chunks). */
+#define LCD_CHUNK_ROWS   80
 #define LCD_CHUNK_BYTES  (LCD_WIDTH_NATIVE * LCD_CHUNK_ROWS * 2)
 
 /* Send one chunk of pixel data.  CASET each chunk; RAMWR for the first chunk
@@ -471,25 +539,14 @@ static void lcd_chunk(const uint8_t *p, uint32_t bytes, bool first)
     static const uint8_t caset[] = {0x00, 0x00, 0x00, (uint8_t)(LCD_WIDTH_NATIVE - 1)};
     lcd_cmd_data(0x2A, caset, 4);
 
-    /* RAMWR header: SINGLE-WIRE on D0 — matches upstream panel_io_spi which
-     * sends the cmd phase of tx_color in 1-bit mode even when quad_mode=1.
-     * Pixel data follows in QUAD on D0..D3, single CS spans both. */
+    /* IDF-style two-phase under one CS:
+     *   1) 4-byte header {0x32, 0x00, RAMWR/RAMWRC, 0x00} single-wire (CPU)
+     *   2) pixel data in QUAD via DMA
+     * Both with CS_SETUP|CS_HOLD so timing matches the proven CPU-only path. */
     uint8_t hdr[4] = {0x32, 0x00, first ? 0x2Cu : 0x3Cu, 0x00};
     cs_lo();
-    spi_write_single(hdr, 4);
-#if 0
-    /* GDMA channel 0 streams the chunk directly from PSRAM into SPI3 TX.
-     * Disabled: produces a consistent ~25-pixel y-offset across the frame
-     * that we couldn't pin down without a logic analyzer.  Probable causes
-     * tried and ruled out: cache flush alignment, descriptor chaining,
-     * MS_DLEN width, EOF mode, BUF_AFIFO reset, FREAD_QUAD, SPI mode 0/3,
-     * 80/40/20/10 MHz, RASET window, USER1/USER2 zeroing, seg_trans_clr_en,
-     * settle delays, GDMA channel reset.  The CPU path stays in service. */
+    spi_write_chunk(SPI_USR_MOSI | SPI_CS_SETUP | SPI_CS_HOLD, hdr, 4);
     spi_write_quad_dma(p, bytes);
-#else
-    /* CPU walks the 64-byte SPI FIFO in a tight loop — slower but correct. */
-    spi_write_quad(p, bytes);
-#endif
     cs_hi();
 }
 
