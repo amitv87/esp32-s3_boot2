@@ -3,6 +3,7 @@ add_executable(touch_lcd
     printf.c
     lcd_axs15231b.c
     touch_axs15231b.c
+    hal_i2c.c
 )
 
 target_include_directories(touch_lcd PRIVATE

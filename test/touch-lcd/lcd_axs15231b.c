@@ -190,9 +190,14 @@ static void spi3_periph_setup(void)
     REG_WRITE(SPI_CLK_GATE_REG(SPI_N),
               SPI_CLK_EN | SPI_MST_CLK_ACTIVE | SPI_MST_CLK_SEL);
 
-    /* SPI clock = APB / 8 = 10 MHz (slow for debug; spec allows up to 40MHz)
-     * CLKCNT_N=7, CLKCNT_H=3, CLKCNT_L=7 — 50% duty cycle. */
+#if 0
+    /* Legacy: SPI clock = APB / 8 = 10 MHz (slow for debug). */
     REG_WRITE(SPI_CLOCK_REG(SPI_N), (7u << 12) | (3u << 6) | (7u << 0));
+#else
+    /* SPI clock = APB / 1 = 80 MHz.  SPI_CLK_EQU_SYSCLK (bit 31) bypasses
+     * the divider entirely.  All other CLOCK_REG bits must be 0. */
+    REG_WRITE(SPI_CLOCK_REG(SPI_N), (1u << 31));
+#endif
 
     /* CTRL: must use SET_BIT (not WRITE) so SPI_D_POL (bit19) and SPI_Q_POL (bit18)
      * keep their default=1 — clearing them inverts D0/D1 data on the wire. */
