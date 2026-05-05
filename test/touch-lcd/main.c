@@ -197,7 +197,7 @@ static void app_main(app_context_t *ctx)
         fb_fill(c);
         lcd_blit_frame(framebuffer);
         printf("Solid fill phase %d done\r\n", phase);
-        for (volatile uint32_t i = 0; i < 60000000u; i++);  /* ~1s */
+        for (volatile uint32_t i = 0; i < 10000000u; i++);  /* ~1s */
     }
     /* Final pattern: 3 horizontal bands red/green/blue. */
     {
