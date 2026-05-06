@@ -125,6 +125,101 @@ static void ioexp_init(bb_i2c_t *bus, uint8_t addr)
            inport, (inport >> 1) & 1, (inport >> 6) & 1);
 }
 
+#define RUN_CLV3_DEMO 1
+
+#if RUN_CLV3_DEMO
+
+#define COLOUR_DEPTH 16
+
+#define GUI_WIDTH    ((172 * 2) / 2)
+#define HEIGHT       ((640 * 2) / 2)
+#define WIDTH        GUI_WIDTH
+
+#include "clv3_widget_demo.h"
+static void clv3_demo_run(){
+  clay_demo_init(gfont_ttfData, gfont_ttfSize);
+  #if CLAY_LITE_END_LAYOUT_PROFILING
+  clay_lite_set_profile_get_us(gctx->micros_now);
+  #endif
+
+  uint32_t last_report = gctx->micros_now();
+  uint32_t last_frame_ticks = gctx->micros_now();
+  bool running = true, should_draw = true;
+  bool prev_pressed = false;
+
+  int prev_x = -1, prev_y = -1;
+
+  clay_demo_frame_config_t cfg = {
+    .get_ticks = gctx->micros_now,
+  };
+
+  while (running) {
+    uint32_t frame_start = gctx->micros_now();
+    uint32_t sb_dt_ms = (frame_start - last_frame_ticks) / 1000;
+    float delta_time = (float)sb_dt_ms / 1000.0f;
+    if (delta_time <= 0.0f || delta_time > 0.5f) {
+      delta_time = 1.0f / TARGET_FRAME_RATE;
+      sb_dt_ms = (uint32_t)(delta_time * 1000.0f + 0.5f);
+    }
+    last_frame_ticks = frame_start;
+
+    if (clv3_scrollbar_begin_frame(&clay_ctx, sb_dt_ms)) should_draw = true;
+
+    touch_point_t pt;
+    // if (touch_read(&touch_point)) {
+    if (touch_read(&pt) && pt.x < 1024 && pt.y < 1024){
+      touch_point_t touch_point = {
+            .x = pt.y, .y = HEIGHT - pt.x,
+            .pressed = pt.pressed,
+        };
+        // printf("touch down:%u @ %u,%u\r\n", touch_point.pressed, touch_point.x, touch_point.y);
+      float scroll_x = 0.0f, scroll_y = 0.0f;
+      #if 0
+      if(prev_pressed && touch_point.pressed){
+        scroll_x = (float)(touch_point.x - prev_x) / 15.0f;
+        scroll_y = (float)(touch_point.y - prev_y) / 15.0f;
+      }
+      #endif
+      if (clay_demo_handle_touch_input(delta_time, prev_pressed || touch_point.pressed ? touch_point.x : -1, prev_pressed || touch_point.pressed ? touch_point.y : -1, touch_point.pressed, scroll_x, scroll_y)) should_draw = true;
+      prev_x = touch_point.x, prev_y = touch_point.y;
+      prev_pressed = touch_point.pressed;
+    }
+
+    if (clay_demo_update_state() || should_draw) {
+      uint8_t num_rects = clay_demo_run_frame(&cfg);
+
+      if (num_rects > 0) {
+        // transfer surface.dirty.rects from surface.buffer to display
+        #if 0
+        for (uint8_t i = 0; i < surface.dirty.count; i++) {
+          gui_rect_t* r = &surface.dirty.rects[i];
+          uint16_t w = r->x2 - r->x1 + 1;
+          uint16_t h = r->y2 - r->y1 + 1;
+          if (w > 0 && h > 0) {
+            uint16_t* buf_start = (uint16_t*)surface.buffer + (r->y1 * surface.width) + r->x1;
+            lcd_blit(r->x1, r->y1, w, h, (uint16_t)surface.width, buf_start);
+          }
+        }
+        #else
+        // lcd_blit_dma2d(&surface);
+        lcd_blit_frame(surface.buffer);
+        #endif
+      }
+      else should_draw = false;
+    }
+
+    uint32_t now = gctx->micros_now();
+    clay_demo_report_stats((double)(now - last_report) / 1000, CLV3_WINDOW_TITLE, 1000000);
+    if (now - last_report >= 1000000) last_report = now;
+
+    again:;
+    uint32_t frame_time = (gctx->micros_now() - frame_start) / 1000;
+    if (frame_time < TARGET_FRAME_TIME_MS) goto again;
+    // if (frame_time < TARGET_FRAME_TIME_MS) bflb_mtimer_delay_ms(TARGET_FRAME_TIME_MS - frame_time);
+  }
+}
+#endif
+
 static void app_main(app_context_t *ctx)
 {
     extern char _bss_start[], _bss_end[];
@@ -191,6 +286,10 @@ static void app_main(app_context_t *ctx)
     touch_init();
     printf("Touch init done.\r\n");
 
+    #if RUN_CLV3_DEMO
+    clv3_demo_run();
+    #else
+
     /* Diagnostic: cycle full-screen solid red → green → blue → bands.
      * Each fill stays visible for ~1 second so we can see if uniform color
      * really covers the whole display.  If it does, addressing is sound and
@@ -242,4 +341,5 @@ static void app_main(app_context_t *ctx)
         frame++;
         // for (volatile int i = 0; i < 10000; i++);
     }
+    #endif
 }

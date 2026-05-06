@@ -4,6 +4,7 @@ add_executable(touch_lcd
     lcd_axs15231b.c
     touch_axs15231b.c
     hal_i2c.c
+    libc_stubs.c
 )
 
 target_include_directories(touch_lcd PRIVATE
@@ -21,17 +22,29 @@ target_include_directories(touch_lcd PRIVATE
 
 target_compile_options(touch_lcd PRIVATE
     -Os -g3 -Wall -Wextra
+    -Wno-unused-value
+    -Wno-sign-compare
+    -Wno-unused-label
+    -Wno-missing-braces
+    -Wno-unused-function
+    -Wno-unused-variable
     -Wno-unused-parameter
+    -Wno-unused-but-set-variable
+    -Wno-misleading-indentation
     -ffunction-sections -fdata-sections
 )
 
 set(APP_LINKER_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/app.ld)
 target_link_options(touch_lcd PRIVATE
+    "-nostdlib"
+    "-nostartfiles"
+    "--specs=nano.specs"
     -T ${APP_LINKER_SCRIPT}
     -Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/touch_lcd.map
     -Wl,--gc-sections
+    -Wl,--print-memory-usage
 )
-target_link_libraries(touch_lcd PRIVATE gcc c m)
+target_link_libraries(touch_lcd PRIVATE m gui_lite gcc c m)
 set_property(TARGET touch_lcd APPEND PROPERTY LINK_DEPENDS ${APP_LINKER_SCRIPT})
 
 set_target_properties(touch_lcd PROPERTIES

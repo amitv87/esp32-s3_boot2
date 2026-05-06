@@ -142,6 +142,7 @@ if(EXISTS ${PACK_SCRIPT})
     add_custom_target(boot2_bin ALL DEPENDS ${BOOT2_BIN})
 endif()
 
+add_subdirectory(gui_lite)
 # ---- Optional test apps ----
 # if(BOOT2_BUILD_TESTS)
     add_subdirectory(test/hello-world)

@@ -129,10 +129,20 @@ typedef struct dma_desc {
     uint32_t next;
 } dma_desc_t;
 
-/* 10-row chunks fit in 1 descriptor; 8 covers up to ~32 KB if we ever
- * grow chunks back toward MS_DLEN's 18-bit limit. */
+/* Full-frame path uses contiguous descriptors (≤4080 bytes each); partial
+ * lcd_blit uses one descriptor per row so it can stride over a wider
+ * surface.
+ *
+ * Pool size cap of 8 is empirical: bumping past 8 (i.e. extending the pool
+ * past 0x3FCD00C0) regresses the full-frame color path to the pre-FIFO-prime
+ * shift symptoms (red→pink, green→light-green, blue→near-black).  Something
+ * the ROM or boot2 latently relies on lives above 0x3FCD00C0 — to grow the
+ * pool we'd need to relocate it (e.g. 0x3FCC0000, well below boot2's
+ * 0x3FCD8700 IRAM start). */
 #define DMA_BYTES_PER_DESC  4080u
 #define DMA_DESC_POOL       8
+/* Per-chunk row cap for lcd_blit — also limited by MS_DLEN's 32 KB. */
+#define LCD_BLIT_CHUNK_ROWS 8u
 
 /* GDMA's OUT_LINK_ADDR field is 20 bits — the peripheral infers upper bits
  * from the address space and expects descriptors in INTERNAL SRAM (matches
@@ -140,9 +150,11 @@ typedef struct dma_desc {
  * in PSRAM, so we can't just declare the pool as a static — the GDMA would
  * read the wrong region.  Park it at a fixed unused-SRAM address instead.
  *
- * boot2 occupies SRAM1 starting at 0x3FCD_1700 (see boot2.ld:
- * iram_seg_start = 0x3FCD_1700 in DRAM view).  0x3FCD_0000 is in the free
- * region just below — 256 bytes is more than enough for 8 × 12-byte descs. */
+ * boot2 occupies SRAM1 from 0x3FCD8700 (iram_seg, IRAM-view 0x403C8700) up
+ * through the stack at 0x3FCE9700.  0x3FCD0000 is in the region below that,
+ * but only the first ~192 bytes are safe — pool sizes >8 (= 96 bytes used,
+ * but 0x3FCD00C0+ corrupts something) regress the full-frame color path.
+ * To grow past 8 descriptors, relocate the pool to e.g. 0x3FCC0000. */
 #define DMA_DESC_SRAM_ADDR  0x3FCD0000u
 static dma_desc_t * const s_dma_descs = (dma_desc_t *)DMA_DESC_SRAM_ADDR;
 
@@ -182,17 +194,61 @@ static void gdma_init(void)
 
 /* IDF-style two-phase: caller sends the 4-byte header {opcode, 0x00, mipi_cmd,
  * 0x00} single-wire under CS-low (via spi_write_chunk), then this function
- * sends the pixel bytes — pure DATA phase, QUAD MOSI, via DMA.
- *
- * Earlier "atomic" approach (cmd phase + addr phase + data phase in one SPI
- * transaction) had a 4-bit color shift on the data — likely from peripheral
- * inserting a transition cycle between single-wire addr and QUAD data when
- * DMA is the data source.  Splitting into two transactions matches what
- * esp_lcd_panel_io_spi.c does (cmd as polling single-wire data + color as
- * QIO data), avoiding the transition entirely. */
+ * sends the pixel bytes — pure DATA phase, QUAD MOSI, via DMA. */
+
+/* Send a pre-built s_dma_descs[] chain of total_bytes via SPI3 QUAD MOSI.
+ * Caller is responsible for filling descriptors and CS framing. */
+static void spi_dma_send_chain(uint32_t total_bytes)
+{
+    /* GDMA reset + outlink load — match NuttX's esp32s3_dma_load: pulse
+     * OUT_RST, then clear+set the OUTLINK_ADDR field as separate writes
+     * BEFORE the START bit. */
+    GDMA_OUT_CONF0_CH0 |= GDMA_BIT_OUT_RST;
+    GDMA_OUT_CONF0_CH0 &= ~GDMA_BIT_OUT_RST;
+
+    GDMA_OUT_LINK_CH0 = GDMA_OUT_LINK_CH0 & ~0xFFFFFu;
+    GDMA_OUT_LINK_CH0 = (GDMA_OUT_LINK_CH0 & ~0xFFFFFu) |
+                       ((uint32_t)&s_dma_descs[0] & 0xFFFFFu);
+
+    REG_SET_BIT(SPI_DMA_CONF_REG(SPI_N),
+                SPI_DMA_AFIFO_RST | SPI_BUF_AFIFO_RST | SPI_RX_AFIFO_RST);
+    REG_SET_BIT(SPI_DMA_CONF_REG(SPI_N), SPI_DMA_TX_ENA);
+
+    REG_WRITE(SPI_USER2_REG(SPI_N), 0);
+    REG_WRITE(SPI_USER1_REG(SPI_N), 0);
+    REG_WRITE(SPI_MS_DLEN_REG(SPI_N), total_bytes * 8u - 1u);
+    REG_WRITE(SPI_USER_REG(SPI_N),
+              SPI_USR_MOSI | SPI_FWRITE_QUAD |
+              SPI_CS_SETUP | SPI_CS_HOLD);
+
+    uint32_t ctrl = REG_READ(SPI_CTRL_REG(SPI_N));
+    ctrl &= ~(SPI_FCMD_DUAL | SPI_FCMD_QUAD |
+              SPI_FADDR_DUAL | SPI_FADDR_QUAD |
+              SPI_DUMMY_OUT);
+    REG_WRITE(SPI_CTRL_REG(SPI_N), ctrl);
+
+    REG_SET_BIT(SPI_CMD_REG(SPI_N), SPI_UPDATE);
+    while (REG_GET_BIT(SPI_CMD_REG(SPI_N), SPI_UPDATE)) {}
+
+    REG_WRITE(SPI_DMA_INT_CLR_REG(SPI_N), SPI_TRANS_DONE_INT_CLR);
+    GDMA_OUT_INT_CLR_CH0 = 0xFFFFFFFFu;
+    GDMA_OUT_LINK_CH0 |= GDMA_BIT_OUTLINK_START;
+
+    /* Wait for DMA to prime the SPI TX FIFO before SPI_USR — otherwise
+     * SPI starts the data phase before the FIFO has data and outputs zero
+     * for the first cycle (4-bit forward shift on the wire). */
+    while (REG_READ(SPI_DMA_CONF_REG(SPI_N)) & SPI_DMA_OUTFIFO_EMPTY) {}
+
+    REG_SET_BIT(SPI_CMD_REG(SPI_N), SPI_USR);
+    while (!(REG_READ(SPI_DMA_INT_RAW_REG(SPI_N)) & SPI_TRANS_DONE_INT_RAW)) {}
+
+    REG_CLR_BIT(SPI_DMA_CONF_REG(SPI_N), SPI_DMA_TX_ENA);
+    REG_WRITE(SPI_USER_REG(SPI_N), 0);
+}
+
 static void spi_write_quad_dma(const void *buf, uint32_t len)
 {
-    /* Build the descriptor chain. */
+    /* Contiguous descriptor chain (each up to DMA_BYTES_PER_DESC). */
     uint32_t a = (uint32_t)buf;
     uint32_t remaining = len;
     int n = 0;
@@ -210,58 +266,7 @@ static void spi_write_quad_dma(const void *buf, uint32_t len)
         remaining -= bytes;
         n++;
     }
-
-    /* GDMA channel reset + outlink load — match NuttX's esp32s3_dma_load:
-     * pulse OUT_RST, then clear+set the OUTLINK_ADDR field as separate
-     * writes BEFORE the START bit. Doing it in one combined write breaks
-     * descriptor chaining — only the first descriptor's data flows. */
-    GDMA_OUT_CONF0_CH0 |= GDMA_BIT_OUT_RST;
-    GDMA_OUT_CONF0_CH0 &= ~GDMA_BIT_OUT_RST;
-
-    GDMA_OUT_LINK_CH0 = GDMA_OUT_LINK_CH0 & ~0xFFFFFu;
-    GDMA_OUT_LINK_CH0 = (GDMA_OUT_LINK_CH0 & ~0xFFFFFu) |
-                       ((uint32_t)&s_dma_descs[0] & 0xFFFFFu);
-
-    /* Reset DMA AFIFO + enable DMA TX */
-    REG_SET_BIT(SPI_DMA_CONF_REG(SPI_N),
-                SPI_DMA_AFIFO_RST | SPI_BUF_AFIFO_RST | SPI_RX_AFIFO_RST);
-    REG_SET_BIT(SPI_DMA_CONF_REG(SPI_N), SPI_DMA_TX_ENA);
-
-    /* No cmd phase, no addr phase — pure DATA QUAD MOSI. */
-    REG_WRITE(SPI_USER2_REG(SPI_N), 0);
-    REG_WRITE(SPI_USER1_REG(SPI_N), 0);
-    REG_WRITE(SPI_MS_DLEN_REG(SPI_N), len * 8u - 1u);
-    REG_WRITE(SPI_USER_REG(SPI_N),
-              SPI_USR_MOSI | SPI_FWRITE_QUAD |
-              SPI_CS_SETUP | SPI_CS_HOLD);
-
-    /* CTRL: clear quad cmd/addr bits + DUMMY_OUT */
-    uint32_t ctrl = REG_READ(SPI_CTRL_REG(SPI_N));
-    ctrl &= ~(SPI_FCMD_DUAL | SPI_FCMD_QUAD |
-              SPI_FADDR_DUAL | SPI_FADDR_QUAD |
-              SPI_DUMMY_OUT);
-    REG_WRITE(SPI_CTRL_REG(SPI_N), ctrl);
-
-    REG_SET_BIT(SPI_CMD_REG(SPI_N), SPI_UPDATE);
-    while (REG_GET_BIT(SPI_CMD_REG(SPI_N), SPI_UPDATE)) {}
-
-    REG_WRITE(SPI_DMA_INT_CLR_REG(SPI_N), SPI_TRANS_DONE_INT_CLR);
-    GDMA_OUT_INT_CLR_CH0 = 0xFFFFFFFFu;
-    GDMA_OUT_LINK_CH0 |= GDMA_BIT_OUTLINK_START;
-
-    /* Wait for DMA to prime the SPI TX FIFO before SPI_USR.  Without this,
-     * SPI starts the data phase before the FIFO has data and outputs zero
-     * for the first cycle — looks like a 4-bit forward shift on the wire
-     * (red→pink, green→light-green, blue→near-black; non-uniform regions
-     * smear into full-width bands).  OUTFIFO_EMPTY=0 → FIFO has data. */
-    while (REG_READ(SPI_DMA_CONF_REG(SPI_N)) & SPI_DMA_OUTFIFO_EMPTY) {}
-
-    REG_SET_BIT(SPI_CMD_REG(SPI_N), SPI_USR);
-    while (!(REG_READ(SPI_DMA_INT_RAW_REG(SPI_N)) & SPI_TRANS_DONE_INT_RAW)) {}
-
-    /* Disable DMA TX for subsequent CPU transactions (CASET, etc.). */
-    REG_CLR_BIT(SPI_DMA_CONF_REG(SPI_N), SPI_DMA_TX_ENA);
-    REG_WRITE(SPI_USER_REG(SPI_N), 0);
+    spi_dma_send_chain(len);
 }
 
 /* ---- QSPI command helpers ----
@@ -591,4 +596,95 @@ void lcd_fill(uint16_t color)
         first = false;
         total -= d;
     }
+}
+
+/* Partial-region blit.  AXS15231B QSPI mode supports CASET (X-window) but
+ * RAMWR auto-resets the Y-cursor to 0 — there is no RASET in QSPI mode.
+ * To honour an arbitrary y/h, we send rows 0..y+h-1 of the (x..x+w-1)
+ * column slice; rows above the AABB come straight from the caller's
+ * surface buffer (which already matches the panel's prior state, so
+ * over-writing them is a visual no-op).
+ *
+ * Each row is one GDMA descriptor so we can stride over a wider surface. */
+void lcd_blit(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+              uint16_t stride, const uint16_t *buffer)
+{
+    if (!w || !h) return;
+
+    uint32_t total_rows = (uint32_t)y + h;
+    uint32_t row_bytes  = (uint32_t)w * 2u;
+    uint32_t stride_b   = (uint32_t)stride * 2u;
+
+    /* Flush from row 0 up through the last AABB row.  Adjacent rows are
+     * contiguous, so the flush range covers all rows we'll DMA from. */
+    uint32_t fb_lo    = (uint32_t)buffer - (uint32_t)y * stride_b;
+    uint32_t fb_hi    = (uint32_t)buffer + (uint32_t)(h - 1) * stride_b + row_bytes;
+    uint32_t flush_lo = fb_lo & ~0x1Fu;
+    uint32_t flush_hi = (fb_hi + 0x1Fu) & ~0x1Fu;
+    Cache_WriteBack_Addr(flush_lo, flush_hi - flush_lo);
+
+    /* CASET — narrow X-window to the dirty columns. */
+    uint8_t caset[4] = {(uint8_t)(x >> 8), (uint8_t)x,
+                        (uint8_t)((x + w - 1) >> 8), (uint8_t)(x + w - 1)};
+    lcd_cmd_data(0x2A, caset, 4);
+
+    /* Per-chunk row cap, bounded by pool size, MS_DLEN's 32 KB, and the
+     * compile-time chunk hint. */
+    uint32_t chunk_rows = LCD_BLIT_CHUNK_ROWS;
+    if (chunk_rows > DMA_DESC_POOL) chunk_rows = DMA_DESC_POOL;
+    if (row_bytes > 0 && chunk_rows * row_bytes > 32768u) {
+        chunk_rows = 32768u / row_bytes;
+    }
+    if (chunk_rows == 0) chunk_rows = 1;
+
+    bool first = true;
+    uint32_t cur_row = 0;
+    while (cur_row < total_rows) {
+        uint32_t rows = total_rows - cur_row;
+        if (rows > chunk_rows) rows = chunk_rows;
+
+        /* Build per-row descriptor chain.  Row r' (panel row) sources
+         * surface[r'][x..x+w-1] = buffer + (r' - y) * stride. */
+        for (uint32_t i = 0; i < rows; i++) {
+            int32_t row_off = (int32_t)(cur_row + i) - (int32_t)y;
+            uint32_t src    = (uint32_t)buffer + (uint32_t)(row_off * (int32_t)stride_b);
+            bool eof = (i == rows - 1);
+            s_dma_descs[i].dw0  = row_bytes |
+                                  (row_bytes << 12) |
+                                  (eof ? (1u << 30) : 0u) |
+                                  (1u << 31);
+            s_dma_descs[i].buf  = src;
+            s_dma_descs[i].next = eof ? 0u : (uint32_t)&s_dma_descs[i + 1];
+        }
+
+        cs_lo();
+        uint8_t hdr[4] = {0x32, 0x00, first ? 0x2Cu : 0x3Cu, 0x00};
+        spi_write_chunk(SPI_USR_MOSI | SPI_CS_SETUP | SPI_CS_HOLD, hdr, 4);
+        spi_dma_send_chain(rows * row_bytes);
+        cs_hi();
+
+        cur_row += rows;
+        first = false;
+    }
+}
+
+void lcd_blit_dma2d(gui_surface_t *surface)
+{
+    if (!surface || surface->dirty.count == 0 || !surface->buffer) return;
+
+    gui_rect_t aabb = surface->dirty.rects[0];
+    for (uint8_t i = 1; i < surface->dirty.count; i++) {
+        gui_rect_t *r = &surface->dirty.rects[i];
+        if (r->x1 < aabb.x1) aabb.x1 = r->x1;
+        if (r->y1 < aabb.y1) aabb.y1 = r->y1;
+        if (r->x2 > aabb.x2) aabb.x2 = r->x2;
+        if (r->y2 > aabb.y2) aabb.y2 = r->y2;
+    }
+
+    uint16_t w = (uint16_t)(aabb.x2 - aabb.x1 + 1);
+    uint16_t h = (uint16_t)(aabb.y2 - aabb.y1 + 1);
+    uint16_t *buf_start = (uint16_t *)surface->buffer +
+                          (uint32_t)aabb.y1 * surface->width + aabb.x1;
+    lcd_blit((uint16_t)aabb.x1, (uint16_t)aabb.y1, w, h,
+             (uint16_t)surface->width, buf_start);
 }
