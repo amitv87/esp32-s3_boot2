@@ -39,8 +39,9 @@ static uint16_t framebuffer[LCD_WIDTH_NATIVE * LCD_HEIGHT_NATIVE]
 
 static inline uint16_t rgb(uint8_t r, uint8_t g, uint8_t b)
 {
-    uint16_t v = ((uint16_t)(r >> 3) << 11) | ((uint16_t)(g >> 2) << 5) | (b >> 3);
-    return (uint16_t)((v >> 8) | (v << 8));
+    /* Native RGB565 (no pre-byteswap — lcd_chunk handles the wire byte
+     * order so callers and gui_lite both produce the same format). */
+    return ((uint16_t)(r >> 3) << 11) | ((uint16_t)(g >> 2) << 5) | (b >> 3);
 }
 
 static void fb_fill(uint16_t color)
@@ -169,9 +170,9 @@ static void clv3_demo_run(){
     // if (touch_read(&touch_point)) {
     if (touch_read(&pt) && pt.x < 1024 && pt.y < 1024){
       touch_point_t touch_point = {
-            .x = pt.y, .y = HEIGHT - pt.x,
-            .pressed = pt.pressed,
-        };
+        .x = pt.y, .y = HEIGHT - pt.x,
+        .pressed = pt.pressed,
+      };
         // printf("touch down:%u @ %u,%u\r\n", touch_point.pressed, touch_point.x, touch_point.y);
       float scroll_x = 0.0f, scroll_y = 0.0f;
       #if 0
@@ -201,8 +202,8 @@ static void clv3_demo_run(){
           }
         }
         #else
-        // lcd_blit_dma2d(&surface);
-        lcd_blit_frame(surface.buffer);
+        lcd_blit_dma2d(&surface);
+        // lcd_blit_frame(surface.buffer);
         #endif
       }
       else should_draw = false;
