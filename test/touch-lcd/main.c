@@ -202,8 +202,8 @@ static void clv3_demo_run(){
           }
         }
         #else
-        lcd_blit_dma2d(&surface);
-        // lcd_blit_frame(surface.buffer);
+        // lcd_blit_dma2d(&surface);
+        lcd_blit_frame(surface.buffer);
         #endif
       }
       else should_draw = false;
