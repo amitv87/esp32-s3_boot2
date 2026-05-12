@@ -75,6 +75,7 @@ extern void psram_exec_cmd(int spi_num, psram_cmd_mode_t mode,
 //-------------------------------------FLASH timing tuning register config-------------------------------------//
 void mspi_timing_get_flash_tuning_configs(mspi_timing_config_t *config)
 {
+#if MSPI_TIMING_FLASH_NEEDS_TUNING
 #if MSPI_TIMING_FLASH_DTR_MODE
 #define FLASH_MODE  DTR_MODE
 #else //MSPI_TIMING_FLASH_STR_MODE
@@ -90,6 +91,9 @@ void mspi_timing_get_flash_tuning_configs(mspi_timing_config_t *config)
 #endif
 
 #undef FLASH_MODE
+#else
+    (void)config;
+#endif  //MSPI_TIMING_FLASH_NEEDS_TUNING
 }
 
 void mspi_timing_flash_init(uint32_t flash_freq_mhz)
@@ -351,70 +355,24 @@ void mspi_timing_config_psram_read_data(uint8_t *buf, uint32_t addr, uint32_t le
  * Best Timing Tuning Params Selection
  *-------------------------------------------------------------------------------------------------*/
 #if (MSPI_TIMING_FLASH_DTR_MODE || MSPI_TIMING_PSRAM_DTR_MODE) && (MSPI_TIMING_CORE_CLOCK_MHZ == 240)
+/* boot2: stubbed PLL frequency scan.
+ *
+ * The full scan repeatedly recalibrates BBPLL to verify PLL-margin of each
+ * MSPI timing sample point. That pulls in rtc_clk_*, regi2c_ctrl_*, and
+ * clk_ll_bbpll_set_config — none of which we vendor (boot2 has its own
+ * one-shot BBPLL setup in clk_init.c and no runtime PLL machinery).
+ *
+ * Returning false causes s_select_best_tuning_config_dtr to fall back to
+ * `end + 1 - consecutive_length` — the first known-good point in the MSPI
+ * delay sweep. Same strategy the 160M DTR path uses. Loses PLL-margin
+ * cross-check; keeps the basic MSPI delay tuning intact.
+ */
 static bool get_working_pll_freq(const uint8_t *reference_data, bool is_flash, uint32_t *out_max_freq, uint32_t *out_min_freq)
 {
-    uint8_t read_data[MSPI_TIMING_TEST_DATA_LEN] = {0};
-    rtc_cpu_freq_config_t previous_config;
-    rtc_clk_cpu_freq_get_config(&previous_config);
-
-    uint32_t big_num = MSPI_TIMING_PLL_FREQ_SCAN_RANGE_MHZ_MAX * 2;  //This number should be larger than MSPI_TIMING_PLL_FREQ_SCAN_RANGE_MHZ_MAX, for error handling
-    uint32_t max_freq = 0;
-    uint32_t min_freq = big_num;
-    soc_xtal_freq_t xtal_freq = rtc_clk_xtal_freq_get();
-
-    for (int pll_mhz_tuning = MSPI_TIMING_PLL_FREQ_SCAN_RANGE_MHZ_MIN; pll_mhz_tuning <= MSPI_TIMING_PLL_FREQ_SCAN_RANGE_MHZ_MAX; pll_mhz_tuning += 8) {
-        //bbpll calibration start
-        regi2c_ctrl_ll_bbpll_calibration_start();
-
-        /**
-         * pll_mhz = xtal_mhz * (oc_div + 4) / (oc_ref_div + 1)
-         */
-        clk_ll_bbpll_set_frequency_for_mspi_tuning(xtal_freq, pll_mhz_tuning, ((pll_mhz_tuning / 4) - 4), 9);
-
-        //wait calibration done
-        while(!regi2c_ctrl_ll_bbpll_calibration_is_done());
-
-        //bbpll calibration stop
-        regi2c_ctrl_ll_bbpll_calibration_stop();
-
-        memset(read_data, 0, MSPI_TIMING_TEST_DATA_LEN);
-        if (is_flash) {
-            mspi_timing_config_flash_read_data(read_data, MSPI_TIMING_FLASH_TEST_DATA_ADDR, MSPI_TIMING_TEST_DATA_LEN);
-        } else {
-            mspi_timing_config_psram_read_data(read_data, MSPI_TIMING_PSRAM_TEST_DATA_ADDR, MSPI_TIMING_TEST_DATA_LEN);
-        }
-
-        if (memcmp(read_data, reference_data, MSPI_TIMING_TEST_DATA_LEN) == 0) {
-            max_freq = MAX(pll_mhz_tuning, max_freq);
-            min_freq = MIN(pll_mhz_tuning, min_freq);
-
-            //Continue to find successful cases
-            continue;
-        }
-
-        if (max_freq != 0) {
-            //The first fail case after successful case(s) is the end
-            break;
-        }
-
-        //If no break, no successful case found, continue to find successful cases
-    }
-
-    //restore PLL config
-    clk_ll_bbpll_set_freq_mhz(previous_config.source_freq_mhz);
-    //bbpll calibration start
-    regi2c_ctrl_ll_bbpll_calibration_start();
-    //set pll
-    clk_ll_bbpll_set_config(previous_config.source_freq_mhz, xtal_freq);
-    //wait calibration done
-    while(!regi2c_ctrl_ll_bbpll_calibration_is_done());
-    //bbpll calibration stop
-    regi2c_ctrl_ll_bbpll_calibration_stop();
-
-    *out_max_freq = max_freq;
-    *out_min_freq = min_freq;
-
-    return (max_freq != 0);
+    (void)reference_data; (void)is_flash;
+    if (out_max_freq) *out_max_freq = 0;
+    if (out_min_freq) *out_min_freq = 0;
+    return false;
 }
 #endif  //Frequency Scanning
 
